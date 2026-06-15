@@ -956,6 +956,7 @@
     // build an id index that also includes ids appearing earlier in this same import batch
     const importIds = new Set(rows.map(r=>r.id).filter(Boolean));
     const existingIds = new Set(ns.map(n=>n.id));
+    const effMode = ns.length===0 ? "append" : S.importMode; // first-run = append
     const created=[], updated=[], merged=[], ignored=[], conflicts=[];
     rows.forEach(r=>{
       // match existing node: prefer id, fall back to title
@@ -963,7 +964,7 @@
       const exByTitle = idxTitle.get(r.title);
       const ex = exById || exByTitle;
       if(ex){
-        if(S.importMode==="append") ignored.push(r);
+        if(effMode==="append") ignored.push(r);
         else updated.push(Object.assign({},r,{_id:ex.id}));
         return;
       }
@@ -983,7 +984,7 @@
       }
       created.push(Object.assign({},r,{_parent:parentRef}));
     });
-    S.importReport = { created, updated, merged, ignored, conflicts, mode:S.importMode };
+    S.importReport = { created, updated, merged, ignored, conflicts, mode:effMode };
     render();
   }
   function applyImport(){
@@ -1081,11 +1082,22 @@
         <div style="margin-top:10px"><div class="muted" style="font-size:10px;margin-bottom:4px">will create:</div>
           ${rep.created.map(c=>`<div style="font-size:11px;color:var(--inkMid)">${(TYPE_CFG[c.type]||{i:"?"}).i} ${esc(c.title)} ${c._parent?"→ under parent":""}</div>`).join("")}
         </div>` : "";
-      const applyDisabled = S.importMode==="preview" || (rep.created.length===0 && rep.updated.length===0);
+      // First-run rule: empty workspace never blocks on Preview.
+      const isEmpty = S.nodes.length === 0;
+      const effectiveMode = isEmpty ? "append" : S.importMode;
+      const nothingToDo = (rep.created.length===0 && rep.updated.length===0);
+      const applyDisabled = (!isEmpty && S.importMode==="preview") || nothingToDo;
+      const applyLabel = nothingToDo
+        ? "Nothing to import 無可匯入"
+        : (isEmpty
+            ? `Confirm Import 確認匯入 (${rep.created.length})`
+            : (S.importMode==="preview"
+                ? "Preview only — pick Merge or Append below 預覽中，請於下方選 Merge / Append"
+                : "Apply Import 套用匯入"));
       reportBlock = html`
       <div class="up" style="margin-top:16px">
         <div class="card" style="padding:16px">
-          <span class="label">Import Report（mode: ${rep.mode}）</span>
+          <span class="label">Import Report（mode: ${effectiveMode}）</span>
           <div class="row2" style="gap:8px 16px;margin-top:8px">
             <div><span class="label">created 新增</span><div style="font-size:12px;color:var(--inkMid)">${rep.created.length}</div></div>
             <div><span class="label">updated 更新</span><div style="font-size:12px;color:var(--inkMid)">${rep.updated.length}</div></div>
@@ -1093,12 +1105,26 @@
             <div><span class="label">ignored 略過</span><div style="font-size:12px;color:var(--inkMid)">${rep.ignored.length}</div></div>
           </div>
           ${conflicts}${willCreate}
+          ${(!isEmpty && S.importMode==="preview" && !nothingToDo) ? `
+            <div class="seg mt14">
+              <button data-act="import-mode" data-mode="merge" style="background:var(--bgMuted);color:var(--inkMid)">Use Merge 用合併</button>
+              <button data-act="import-mode" data-mode="append" style="background:var(--bgMuted);color:var(--inkMid)">Use Append 用新增</button>
+            </div>` : ""}
           <button class="btn btn-primary full mt14" data-act="import-apply" ${applyDisabled?"disabled":""}>
-            ${S.importMode==="preview"?"Preview only — switch to Merge/Append to apply":"Apply Import 套用匯入"}
+            ${applyLabel}
           </button>
         </div>
       </div>`;
     }
+    const isEmptyWs = S.nodes.length === 0;
+    const modeSelector = isEmptyWs ? `
+      <div class="note-muted" style="border-radius:var(--r);padding:10px 12px;margin-bottom:14px;font-size:11px">
+        First import — mode is <b>Append 新增</b> automatically. 首次匯入：自動使用「新增」模式。
+      </div>` : `
+      <div class="seg mb14">
+        ${[["preview","Preview Diff 預覽"],["merge","Merge 合併"],["append","Append 新增"]].map(([m,t])=>`
+          <button data-act="import-mode" data-mode="${m}" class="${S.importMode===m?"on":""}" style="${S.importMode===m?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
+      </div>`;
     return html`
     ${topbar("Import 匯入","Import › Merge › Export · never overwrite")}
     <div class="pad">
@@ -1106,10 +1132,7 @@
         Load an Excel/CSV file or paste rows. Supports the <b>full schema</b> (id, type, parentId, …) or the <b>short form</b> (title, type, parentTitle, summary). Import never replaces existing nodes.
         可載入 Excel/CSV 或貼上。支援<b>完整欄位</b>（id, type, parentId…）或<b>簡式</b>（title, type, parentTitle, summary）。匯入不會覆蓋既有資料。
       </div>
-      <div class="seg mb14">
-        ${[["preview","Preview Diff 預覽"],["merge","Merge 合併"],["append","Append 新增"]].map(([m,t])=>`
-          <button data-act="import-mode" data-mode="${m}" class="${S.importMode===m?"on":""}" style="${S.importMode===m?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
-      </div>
+      ${modeSelector}
       <div class="drop mb14" data-act="pickfile">
         <div style="font-size:20px;margin-bottom:4px">⤓</div>
         <div style="font-size:12px;color:var(--inkMid)">Load Excel / CSV file 載入檔案</div>
