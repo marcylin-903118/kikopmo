@@ -9,6 +9,9 @@
 
   const LS_KEY = "kiko_pmo_v41a_nodes";
   const LS_ROLE = "kiko_pmo_v41a_role";
+  const LS_SYNC_URL = "kiko_pmo_sync_url";       // Apps Script Web App URL (this device)
+  const LS_SYNC_META = "kiko_pmo_sync_meta";     // {at, device} last sync info
+  const LS_DEVICE = "kiko_pmo_device";           // friendly device name (iPhone / Laptop…)
 
   /* ─── bilingual labels ─────────────────────────────────────────────────── */
   const L = {
@@ -394,6 +397,31 @@
   }
   function rootPortfolio(ns,n){ let cur=n,g=0; while(cur&&cur.parentId&&g++<6){ cur=byId(ns,cur.parentId); } return cur; }
 
+  // ── friendly (non-architecture) labels for default mode ──────────────────────
+  const FRIENDLY = { portfolio:"大事 Big Thing", project:"交付 Deliverable", branch:"路線 Route", work:"下一步 Next Action" };
+  function typeWord(t){ return S.advanced ? lbl(t) : (FRIENDLY[t]||t); }
+
+  // ── hierarchy code: portfolio=letter(A,B,…), project=A.1, branch=A.1.a, work=A.1.a.i ──
+  const LETTERS="ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const ROMAN=["i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii"];
+  function buildCodes(ns){
+    const code={};
+    const ports=ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
+    ports.forEach((p,pi)=>{
+      code[p.id]=LETTERS[pi]||("P"+(pi+1));
+      childrenOf(ns,p.id).filter(n=>n.type==="project").forEach((pr,ji)=>{
+        code[pr.id]=code[p.id]+"."+(ji+1);
+        childrenOf(ns,pr.id).filter(n=>n.type==="branch").forEach((br,bi)=>{
+          code[br.id]=code[pr.id]+"."+(LETTERS[bi]||("b"+bi)).toLowerCase();
+          childrenOf(ns,br.id).filter(n=>n.type==="work").forEach((wk,wi)=>{
+            code[wk.id]=code[br.id]+"."+(ROMAN[wi]||("w"+wi));
+          });
+        });
+      });
+    });
+    return code;
+  }
+
   /* ─── state ────────────────────────────────────────────────────────────── */
   const S = {
     role:null,          // 'bizdev' | 'factory'
@@ -407,16 +435,163 @@
     importRaw:"",
     importReport:null,
     mdPreview:false,
+    advanced:false,     // UX: hide architecture terms by default
+    blockFor:null,      // work id whose blocker note is being entered
+    blockText:"",
+    // ── Google Sheets sync (via Apps Script Web App) ──
+    syncUrl:"",         // user-pasted Web App URL
+    syncDevice:"",      // this device's friendly name
+    syncStatus:"idle",  // idle | syncing | ok | error
+    syncMeta:null,      // { at:ISO, device:"iPhone" }
+    syncMsg:"",         // last status message
+    dirty:false,        // unsynced local changes exist
+    settingsUrlDraft:"",// settings page input buffer
+    settingsDevDraft:"",
   };
+
+  // ── tag-encoded metadata (schema unchanged: stored as special tags) ──────────
+  // case number  → tag "案號:XXX"     D-DAY → tag "DDAY:YYYY-MM-DD"   pin → tag "PIN"
+  const TAG_CASE = "案號:", TAG_DDAY = "DDAY:", TAG_PIN = "PIN";
+  function getCaseNo(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_CASE)===0); return t?t.slice(TAG_CASE.length):""; }
+  function getDday(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_DDAY)===0); return t?t.slice(TAG_DDAY.length):""; }
+  function isPinned(n){ return (n.tags||[]).indexOf(TAG_PIN)>-1; }
+  function visibleTags(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_CASE)!==0&&x.indexOf(TAG_DDAY)!==0&&x!==TAG_PIN); }
+  function setTagKV(n, prefix, value){
+    let tags=(n.tags||[]).filter(x=>x.indexOf(prefix)!==0);
+    if(value) tags.push(prefix+value);
+    return tags;
+  }
+  function togglePin(n){
+    const tags=(n.tags||[]).slice(); const i=tags.indexOf(TAG_PIN);
+    if(i>-1) tags.splice(i,1); else tags.push(TAG_PIN);
+    return tags;
+  }
+  // effective deadline = explicit node.deadline OR DDAY tag
+  function effDeadline(n){ return n.deadline || getDday(n) || null; }
+  // a node is "in progress / 卡點" if it's not archived and not done/complete
+  function inProgress(n){
+    if(n.type==="portfolio") return n.portfolioState!=="archived";
+    if(n.type==="work") return n.workStatus!=="done";
+    if(n.type==="project"||n.type==="branch") return n.executionStage!=="complete";
+    return false;
+  }
 
   function load(){
     try { const r=localStorage.getItem(LS_KEY); if(r) S.nodes=JSON.parse(r); } catch(e){}
     try { const role=localStorage.getItem(LS_ROLE); if(role) S.role=role; } catch(e){}
+    try { const u=localStorage.getItem(LS_SYNC_URL); if(u) S.syncUrl=u; } catch(e){}
+    try { const d=localStorage.getItem(LS_DEVICE); if(d) S.syncDevice=d; } catch(e){}
+    try { const m=localStorage.getItem(LS_SYNC_META); if(m) S.syncMeta=JSON.parse(m); } catch(e){}
   }
+  let _lastNodesJson = "";
   function persist(){
-    try { if(S.nodes) localStorage.setItem(LS_KEY, JSON.stringify(S.nodes)); } catch(e){}
+    try {
+      if(S.nodes){
+        const j = JSON.stringify(S.nodes);
+        localStorage.setItem(LS_KEY, j);
+        if(_lastNodesJson && j!==_lastNodesJson){ S.dirty = true; }
+        _lastNodesJson = j;
+      }
+    } catch(e){}
     try { if(S.role) localStorage.setItem(LS_ROLE, S.role); } catch(e){}
+    try { if(S.syncUrl) localStorage.setItem(LS_SYNC_URL, S.syncUrl); } catch(e){}
+    try { if(S.syncDevice) localStorage.setItem(LS_DEVICE, S.syncDevice); } catch(e){}
+    try { if(S.syncMeta) localStorage.setItem(LS_SYNC_META, JSON.stringify(S.syncMeta)); } catch(e){}
   }
+
+  /* ═══ GOOGLE SHEETS SYNC (via Apps Script Web App) ═══════════════════════════
+     Sync layer, NOT source of truth. Import › Merge › Export still governs.
+     - pull(): GET ?action=load   → returns {nodes:[...], updatedAt, device}
+     - push(): POST {action:save, nodes, device}
+     Triggers: manual button · every 30s if dirty · on Done/Import/Capture-confirm
+     Single user → last-write-wins.                                              */
+  let syncTimer = null;
+  function markDirty(){ S.dirty = true; }
+  function deviceName(){ return S.syncDevice || "Device"; }
+
+  async function syncPush(reason){
+    if(!S.syncUrl){ return; }
+    S.syncStatus="syncing"; S.syncMsg="同步中…"; safeRender();
+    try {
+      const res = await fetch(S.syncUrl, {
+        method:"POST",
+        headers:{ "Content-Type":"text/plain;charset=utf-8" }, // text/plain avoids CORS preflight to Apps Script
+        body: JSON.stringify({ action:"save", device:deviceName(), nodes:S.nodes })
+      });
+      const data = await res.json();
+      if(data && data.ok){
+        S.dirty=false; S.syncStatus="ok";
+        S.syncMeta={ at:new Date().toISOString(), device:deviceName() };
+        S.syncMsg="已同步 "+(reason||"");
+        persist();
+      } else { throw new Error(data && data.error ? data.error : "save failed"); }
+    } catch(err){
+      S.syncStatus="error"; S.syncMsg="同步失敗：" + (err.message||err);
+    }
+    safeRender();
+  }
+
+  async function syncPull(opts){
+    opts = opts || {};
+    if(!S.syncUrl){ if(opts.alert) alert("尚未設定同步網址"); return; }
+    S.syncStatus="syncing"; S.syncMsg="讀取雲端…"; safeRender();
+    try {
+      const res = await fetch(S.syncUrl + (S.syncUrl.indexOf("?")>-1?"&":"?") + "action=load", { method:"GET" });
+      const data = await res.json();
+      if(data && data.ok){
+        const remote = Array.isArray(data.nodes) ? data.nodes : [];
+        if(opts.merge && S.nodes && S.nodes.length){
+          // merge by id: remote is source for matched ids, keep local-only nodes
+          const map = new Map(S.nodes.map(n=>[n.id,n]));
+          remote.forEach(rn=>map.set(rn.id, rn));
+          S.nodes = Array.from(map.values());
+        } else {
+          S.nodes = remote;
+        }
+        S.dirty=false; S.syncStatus="ok";
+        S.syncMeta={ at:new Date().toISOString(), device:(data.device||"cloud") };
+        S.syncMsg="已從雲端載入";
+        persist();
+      } else { throw new Error(data && data.error ? data.error : "load failed"); }
+    } catch(err){
+      S.syncStatus="error"; S.syncMsg="讀取失敗：" + (err.message||err);
+    }
+    safeRender();
+  }
+
+  function startAutoSync(){
+    if(syncTimer) clearInterval(syncTimer);
+    syncTimer = setInterval(()=>{ if(S.syncUrl && S.dirty){ syncPush("auto"); } }, 30000);
+  }
+  function syncLabel(){
+    if(!S.syncUrl) return "未連線";
+    if(S.syncStatus==="syncing") return "同步中…";
+    if(S.syncStatus==="error") return "⚠ " + S.syncMsg;
+    if(S.syncMeta){
+      const d=new Date(S.syncMeta.at);
+      const hh=String(d.getHours()).padStart(2,"0"), mm=String(d.getMinutes()).padStart(2,"0");
+      return `已同步 ${hh}:${mm} · ${S.syncMeta.device}` + (S.dirty?" ·有未同步":"");
+    }
+    return S.dirty?"有未同步變更":"已連線";
+  }
+  // guarded render so async callbacks before first render don't crash
+  function safeRender(){ try{ render(); }catch(e){} }
+  function syncSaveSettings(){
+    S.syncUrl = (S.settingsUrlDraft!=null?S.settingsUrlDraft:S.syncUrl).trim();
+    S.syncDevice = (S.settingsDevDraft!=null?S.settingsDevDraft:S.syncDevice).trim();
+    S.settingsUrlDraft=""; S.settingsDevDraft="";
+    persist();
+    if(S.syncUrl) startAutoSync();
+    S.syncMsg="設定已儲存"; render();
+  }
+  function syncClearSettings(){
+    if(!confirm("清除同步設定？（雲端資料不會被刪，只是這台不再連線）")) return;
+    S.syncUrl=""; S.syncMeta=null; S.syncStatus="idle";
+    try{ localStorage.removeItem(LS_SYNC_URL); localStorage.removeItem(LS_SYNC_META); }catch(e){}
+    if(syncTimer) clearInterval(syncTimer);
+    render();
+  }
+  function maybeSync(reason){ if(S.syncUrl){ syncPush(reason); } }
 
   /* ─── tiny DOM helper ──────────────────────────────────────────────────── */
   const app = () => document.getElementById("app");
@@ -450,11 +625,13 @@
       case "portfolio": screen = viewPortfolio(); break;
       case "import":    screen = S.role==="bizdev"?viewImport():viewDaily(); break;
       case "export":    screen = viewExport(); break;
+      case "settings":  screen = viewSettings(); break;
       case "detail":    screen = viewDetail(); break;
       default:          screen = viewDaily();
     }
     const nav = S.view==="detail" ? "" : bottomNav();
-    root.innerHTML = `<div class="screen">${screen}</div>${nav}`;
+    const overlay = S.blockFor ? blockerModalHtml() : "";
+    root.innerHTML = `<div class="screen">${screen}</div>${nav}${overlay}`;
     bind();
   }
 
@@ -526,9 +703,9 @@
   }
   function bottomNav(){
     const items = S.role==="factory"
-      ? [["daily","Daily 焦點","☀"],["portfolio","Portfolio 組合","◉"],["export","Export 匯出","⤓"]]
+      ? [["daily","Daily 焦點","☀"],["portfolio","Portfolio 組合","◉"],["export","Export 匯出","⤓"],["settings","設定","⚙"]]
       : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","Portfolio 組合","◉"],
-         ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"]];
+         ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"],["settings","設定","⚙"]];
     return `<nav class="bottomnav">` + items.map(([id,label,ic])=>`
       <button data-act="nav" data-view="${id}" class="${S.view===id?"on":""}">
         <span class="ic">${ic}</span><span class="tx">${label}</span>
@@ -536,80 +713,123 @@
       </button>`).join("") + `</nav>`;
   }
 
-  /* ─── DAILY PMO ────────────────────────────────────────────────────────── */
+  /* ─── DAILY (所有進行中 + 卡點) ─────────────────────────────────────────── */
   function viewDaily(){
     const ns = S.nodes;
-    const activeIds = new Set(ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="active").map(n=>n.id));
-    const works = ns.filter(n=>n.type==="work"&&n.workStatus!=="done"&&!n.mergeIntoId);
-    const scored = works.map(w=>{
-      const root=rootPortfolio(ns,w);
-      const inActive = root && activeIds.has(root.id);
-      const dl = w.deadline ? new Date(w.deadline)-Date.now() : Infinity;
-      return { w, inActive, dl };
-    }).sort((a,b)=>{
-      if(a.inActive!==b.inActive) return a.inActive?-1:1;
-      if(a.dl!==b.dl) return a.dl-b.dl;
-      return daysSince(b.w.lastProgress)-daysSince(a.w.lastProgress);
+    const codes = buildCodes(ns);
+    // all in-progress work items (not done, not archived-root)
+    const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId)
+      .filter(w=>{ const r=rootPortfolio(ns,w); return !r || r.portfolioState!=="archived"; });
+
+    function dval(w){ const d=effDeadline(w); return d? new Date(d).getTime() : Infinity; }
+    const sorted = works.slice().sort((a,b)=>{
+      const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;
+      if(pa!==pb) return pa-pb;                         // pinned first
+      const da=dval(a), db=dval(b);
+      if(da!==db) return da-db;                         // by D-DAY (undated last)
+      return daysSince(b.lastProgress)-daysSince(a.lastProgress);
     });
-    const one = scored[0] && scored[0].w;
-    const rest = scored.slice(1,3).map(s=>s.w);
-    const blocked = ns.filter(n=>(n.type==="project"||n.type==="branch")&&n.executionStage==="blocked"&&!n.mergeIntoId);
-    const stale = ns.filter(isStale);
 
-    const right = `<button class="btn btn-ghost sm" data-act="logout">Switch 切換 →</button>`;
+    const right = `
+      <button class="btn btn-ghost sm" data-act="toggle-advanced" title="切換進階">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>
+      <button class="btn btn-ghost sm" data-act="logout">切換 →</button>`;
 
-    let oneBlock;
-    if(one){
-      oneBlock = html`
-      <div class="card" style="background:var(--mossBg);border-color:rgba(94,125,96,.3);padding:18px;margin-bottom:22px">
-        <div class="tap" data-act="open" data-id="${one.id}">
-          <div style="font-size:16px;font-weight:600;margin-bottom:4px">${esc(one.title)}</div>
-          <div style="font-size:12px;color:var(--inkMid);margin-bottom:10px">${esc(one.summary||"")}</div>
-          <div class="flex gap8 wrap aic">
-            <span style="font-size:10px;color:var(--inkLight)">owner 負責：${esc(one.owner||"—")}</span>
-            ${one.deadline?`<span style="font-size:10px;color:var(--clay)">· due ${fmt(one.deadline)}</span>`:""}
-            ${one.firstSuccessEvent?`<span style="font-size:10px;color:var(--inkLight)">· win：${esc(one.firstSuccessEvent)}</span>`:""}
-          </div>
-        </div>
-        <div class="seg mt10">
-          ${["todo","doing","done"].map(s=>`
-            <button data-act="workstatus" data-id="${one.id}" data-status="${s}"
-              class="${one.workStatus===s?"on":""}"
-              style="${one.workStatus===s?`background:${WORK_CFG[s].c};color:#fff`:""}">
-              ${WORK_CFG[s].i} ${lblEn(s)}</button>`).join("")}
-        </div>
-      </div>`;
+    // group by big-thing (root portfolio) so it reads like the daily report
+    const groups = {};
+    sorted.forEach(w=>{ const r=rootPortfolio(ns,w); const k=r?r.id:"_"; (groups[k]=groups[k]||[]).push(w); });
+
+    let body = "";
+    if(sorted.length===0){
+      body = `<div class="empty">目前沒有進行中的工作 🎉<br><span style="font-size:11px">No work in progress.</span></div>`;
     } else {
-      oneBlock = `<div class="card" style="border:1px dashed var(--border);padding:20px;margin-bottom:22px" class="center"><div class="empty">No open work items. 無待辦工作項。</div></div>`;
+      Object.keys(groups).forEach(gid=>{
+        const root = gid==="_"?null:byId(ns,gid);
+        const caseNo = root?getCaseNo(root):"";
+        const head = root
+          ? `<div class="flex aic gap8" style="margin:14px 2px 8px">
+               <span style="font-size:12px;font-weight:700;color:var(--moss)">${S.advanced?"":(codes[root.id]+" ")}${esc(root.title)}</span>
+               ${caseNo?`<span class="tag" style="background:var(--slateBg);color:var(--slate)">#${esc(caseNo)}</span>`:""}
+               ${S.advanced?`<span class="tag">${lbl("portfolio")}</span>`:""}
+             </div>`
+          : "";
+        body += head + groups[gid].map(w=>workCardHtml(w, codes)).join("");
+      });
     }
 
     return html`
-    ${topbar("Daily PMO 每日焦點", fmt(todayStr()), right)}
+    ${topbar("Daily 今日進行", fmt(todayStr()), right)}
+    ${syncBar()}
     <div class="pad">
-      <div class="muted" style="font-size:11px;margin-bottom:16px">One focus today. 今天只專注一件事。</div>
-      <div style="font-size:10px;font-weight:700;color:var(--moss);letter-spacing:.1em;margin-bottom:8px">TODAY'S ONE THING 今日唯一</div>
-      ${oneBlock}
-      ${rest.length?`
-        <div style="font-size:10px;font-weight:700;color:var(--inkLight);letter-spacing:.1em;margin-bottom:8px">SECONDARY (MAX 2) 次要</div>
-        ${rest.map(w=>`
-          <div class="card tap" data-act="open" data-id="${w.id}" style="padding:11px 13px;margin-bottom:8px">
-            <div style="font-size:13px;font-weight:600">${esc(w.title)}</div>
-            <div style="font-size:11px;color:var(--inkMid)">${esc(w.owner||"—")} · ${w.deadline?"due "+fmt(w.deadline):"no deadline"}</div>
-          </div>`).join("")}
-        <div class="spacer"></div>` : ""}
-      <div class="divider"></div>
-      <div class="tiles mt6">
-        <div class="tile" style="background:var(--clayBg)"><div class="v" style="color:var(--clay)">${blocked.length}</div><div class="k">Blocked 受阻</div></div>
-        <div class="tile" style="background:var(--bambooBg)"><div class="v" style="color:var(--bamboo)">${stale.length}</div><div class="k">Stale &gt;7d 逾期未動</div></div>
+      <div class="muted" style="font-size:11px;margin-bottom:8px">
+        所有未完成的工作都在這裡，依交期排序（已釘選優先）。All in-progress work, sorted by D-DAY.
       </div>
-      <div class="note mt14">Daily PMO only changes work status &amp; progress. Activation lives in Monthly. 每日僅改工作狀態與進度。</div>
+      <div class="flex gap6 wrap mb14" style="font-size:10px;color:var(--inkLight)">
+        <span>✅ 完成</span><span>⏸ 延後</span><span>🚧 卡住</span><span>➕ 做更多</span>
+      </div>
+      ${body}
+    </div>`;
+  }
+
+  // a single work card with case/code/D-DAY + four symbol buttons
+  function workCardHtml(w, codes){
+    const dd = effDeadline(w);
+    const overdue = dd && new Date(dd) < Date.now();
+    const stale = isStale(w);
+    const pinned = isPinned(w);
+    const code = codes[w.id] || "";
+    const blockTag = (w.tags||[]).find(x=>x.indexOf("🚧")===0); // blocker note stored as tag
+    return html`
+    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pinned?'border-left:3px solid var(--bamboo)':''}">
+      <div class="flex between aic" style="gap:8px">
+        <div class="grow tap" data-act="open" data-id="${w.id}">
+          <div class="flex aic gap6" style="margin-bottom:2px">
+            ${code?`<span style="font-size:10px;color:var(--inkLight);font-weight:700">${code}</span>`:""}
+            <span style="font-size:14px;font-weight:600">${esc(w.title)}</span>
+          </div>
+          <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
+            ${getCaseNo(w)?`<span class="tag" style="background:var(--slateBg);color:var(--slate)">#${esc(getCaseNo(w))}</span>`:""}
+            ${w.owner?`<span>負責 ${esc(w.owner)}</span>`:""}
+            ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`:`<span>交期未定</span>`}
+            ${stale?`<span class="badge-stale">⏱ ${daysSince(w.lastProgress)}d</span>`:""}
+          </div>
+          ${blockTag?`<div style="margin-top:6px;font-size:11px;color:var(--clay);background:var(--clayBg);border-radius:var(--rsm);padding:5px 8px">🚧 ${esc(blockTag.slice(2).replace(/^:/,''))}</div>`:""}
+        </div>
+        <button class="btn btn-ghost sm" data-act="pin" data-id="${w.id}" title="釘選" style="padding:4px 8px">${pinned?"📌":"📍"}</button>
+      </div>
+      <div class="flex gap6 mt10">
+        <button class="btn sm" style="flex:1;background:var(--mossBg);color:var(--moss)" data-act="w-done" data-id="${w.id}">✅ 完成</button>
+        <button class="btn sm" style="flex:1;background:var(--bgMuted);color:var(--inkMid)" data-act="w-delay" data-id="${w.id}">⏸ 延後</button>
+        <button class="btn sm" style="flex:1;background:var(--clayBg);color:var(--clay)" data-act="w-block" data-id="${w.id}">🚧 卡住</button>
+        <button class="btn sm" style="flex:1;background:var(--bambooBg);color:var(--bamboo)" data-act="w-more" data-id="${w.id}">➕ 做更多</button>
+      </div>
+    </div>`;
+  }
+
+  function blockerModalHtml(){
+    const w = byId(S.nodes, S.blockFor);
+    return html`
+    <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
+      <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd)">
+        <div class="flex between aic mb10">
+          <div style="font-family:'Lora',serif;font-size:16px">🚧 卡在哪？</div>
+          <button class="back" data-act="blk-cancel">×</button>
+        </div>
+        <div style="font-size:11px;color:var(--inkLight);margin-bottom:10px">${esc(w?w.title:"")}</div>
+        <textarea data-blk="text" rows="2" placeholder="一句話：卡在哪 / 等誰 / 等什麼…" style="margin-bottom:10px">${esc(S.blockText||"")}</textarea>
+        <div class="flex gap8">
+          <button class="btn btn-ghost" style="flex:1" data-act="blk-cancel">取消</button>
+          <button class="btn btn-clay" style="flex:2" data-act="blk-save">標記卡住 🚧</button>
+        </div>
+      </div>
     </div>`;
   }
 
   /* ─── CAPTURE ──────────────────────────────────────────────────────────── */
-  const cap = { raw:"", signal:"screenshot", target:"", parentId:"", title:"", so:false, sd:false, sr:false, mode:"explore" };
+  const cap = { raw:"", signal:"screenshot", target:"", parentId:"", title:"", so:false, sd:false, sr:false, mode:"explore",
+                images:[], q_what:"", q_kind:"", q_ball:"", q_next:"", caseNo:"", dday:"" };
   function viewCapture(){
     const ns = S.nodes;
+    const codes = buildCodes(ns);
     const portfolios = ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
     const projects   = ns.filter(n=>n.type==="project"&&!n.mergeIntoId);
     const branches   = ns.filter(n=>n.type==="branch"&&!n.mergeIntoId);
@@ -617,84 +837,106 @@
     const parentChoices = { update:anyNode, work:branches, branch:projects, project:portfolios, suggest:[] }[cap.target] || [];
     const mergeYes = [cap.so,cap.sd,cap.sr].filter(Boolean).length;
 
+    // friendly labels in default mode, real types in advanced
     const targetOpts = [
-      ["","— choose 選擇 —"],
-      ["update","Update 更新 → append log"],
-      ["work","Work Item 工作項 → under Branch"],
-      ["branch","Branch 支線 → under Project"],
-      ["project","Project 專案 → under Portfolio"],
-      ["suggest","Suggest Portfolio 建議組合 (exceptional)"],
+      ["","— 選擇 / choose —"],
+      ["update", S.advanced?"Update 更新 → append log":"記一筆進度 → 加到現有項目"],
+      ["work",   S.advanced?"Work 工作項 → under Branch":"新的下一步 → 放進某條路線"],
+      ["branch", S.advanced?"Branch 路線 → under Project":"新的路線 → 放進某個交付"],
+      ["project",S.advanced?"Project 交付 → under Portfolio":"新的交付 → 放進某件大事"],
+      ["suggest",S.advanced?"Suggest Portfolio":"開一件新的大事（少用）"],
     ];
 
     let parentBlock = "";
     if(cap.target && cap.target!=="suggest"){
+      const lblTxt = cap.target==="update" ? "加到哪個項目 Attach to" : "歸到哪個上層 Parent";
       parentBlock = html`
         <div class="field">
-          <span class="label">${cap.target==="update"?"Attach to 附加到":"Parent 父節點"}</span>
+          <span class="label">${lblTxt}</span>
           <select data-cap="parentId">
-            <option value="">— select 選擇 —</option>
-            ${parentChoices.map(n=>`<option value="${n.id}" ${cap.parentId===n.id?"selected":""}>${TYPE_CFG[n.type].i} ${esc(n.title)}</option>`).join("")}
+            <option value="">— 選擇 select —</option>
+            ${parentChoices.map(n=>`<option value="${n.id}" ${cap.parentId===n.id?"selected":""}>${codes[n.id]?codes[n.id]+" ":""}${esc(n.title)}${S.advanced?" ["+lbl(n.type)+"]":""}</option>`).join("")}
           </select>
         </div>`;
     }
-    let titleBlock = "";
+    let detailBlock = "";
     if(cap.target && cap.target!=="update" && cap.target!=="suggest"){
-      titleBlock = html`<div class="field"><span class="label">Title 標題</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="New node title 新節點標題"></div>`;
+      detailBlock = html`
+        <div class="field"><span class="label">標題 Title</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="這個項目叫什麼"></div>
+        <div class="row2">
+          <div class="field"><span class="label">案號 Case No.（選填）</span><input type="text" data-cap="caseNo" value="${esc(cap.caseNo)}" placeholder="DP706…"></div>
+          <div class="field"><span class="label">交期 D-DAY（可留空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
+        </div>`;
     }
     let suggestBlock = "";
     if(cap.target==="suggest"){
       suggestBlock = html`
       <div class="card" style="background:var(--bambooBg);border-color:rgba(184,168,120,.4);padding:14px;margin-bottom:12px">
-        <span class="label">Merge check 合併檢查（≥2 → 建議合併）</span>
-        ${[["so","Shared outcome? 共同成果？"],["sd","Shared deadline? 共同期限？"],["sr","Shared resources? 共用資源？"]].map(([k,t])=>`
+        <span class="label">先確認：真的需要一件新大事嗎？Merge check（≥2 → 建議併入既有）</span>
+        ${[["so","有共同成果？ Shared outcome"],["sd","有共同交期？ Shared deadline"],["sr","有共用資源？ Shared resources"]].map(([k,t])=>`
           <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--inkMid);padding:4px 0">
             <input type="checkbox" data-cap-check="${k}" ${cap[k]?"checked":""}> ${t}
           </label>`).join("")}
         ${mergeYes>=2
-          ? `<div style="font-size:11px;color:var(--clay);font-weight:600;margin-top:8px">⚠ ≥2 yes → prefer MERGE into an existing node, not a new Portfolio. 建議合併到既有節點。</div>`
-          : `<div style="font-size:11px;color:var(--moss);margin-top:8px">&lt;2 yes → a new Portfolio may be justified. 可建立新組合。</div>`}
-        <div class="field mt8"><span class="label">Portfolio title 組合標題</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="New portfolio name…"></div>
-        <div class="field"><span class="label">Project mode 模式</span>
-          <select data-cap="mode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.mode===m?"selected":""}>${lbl(m)}</option>`).join("")}</select>
+          ? `<div style="font-size:11px;color:var(--clay);font-weight:600;margin-top:8px">⚠ ≥2 → 建議併入既有大事，而非新開。</div>`
+          : `<div style="font-size:11px;color:var(--moss);margin-top:8px">&lt;2 → 可以開一件新大事。</div>`}
+        <div class="field mt8"><span class="label">大事名稱 Big-thing title</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="例：某客戶新合作"></div>
+        <div class="field"><span class="label">模式 Mode</span>
+          <select data-cap="mode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.mode===m?"selected":""}>${S.advanced?lbl(m):({deliver:"要交付的",build:"要建構的",explore:"要探索的"}[m])}</option>`).join("")}</select>
         </div>
       </div>`;
     }
 
     const disabled = capCommitDisabled();
+    const imgThumbs = cap.images.length
+      ? `<div class="flex gap6 wrap" style="margin-top:8px">${cap.images.map((src,i)=>`<div style="position:relative"><img src="${src}" style="width:64px;height:64px;object-fit:cover;border-radius:var(--rsm);border:1px solid var(--border)"><button data-act="cap-rmimg" data-idx="${i}" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--clay);color:#fff;border:none;font-size:11px">×</button></div>`).join("")}</div>`
+      : "";
+
+    const right = `<button class="btn btn-ghost sm" data-act="toggle-advanced">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>`;
 
     return html`
-    ${topbar("Capture 擷取","disposable intake · classify to resolve")}
+    ${topbar("Capture 擷取", `${cap.images.length} 張截圖 · 一個 session`, right)}
     <div class="pad">
       <div class="note-muted" style="border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:11px;line-height:1.6">
-        Capture is disposable. Classify it down the tree — attach as <b>low</b> as possible.
-        擷取是暫時的，分類後即完成；盡量往低層掛。
+        一次可放多張截圖（同一段對話）。先簡單回答幾個問題，再決定歸到哪。Multiple screenshots = one session.
       </div>
 
-      <span class="label">Screenshot 截圖（manual-fill）</span>
+      <span class="label">截圖 Screenshots（可多張）</span>
       <div class="drop" data-act="pickimg" id="capdrop">
         <div style="font-size:22px;margin-bottom:4px">📷</div>
-        <div style="font-size:12px;color:var(--inkMid)">Tap to add 點擊新增（OCR deferred）</div>
-        <input type="file" accept="image/*" id="capimg" style="display:none">
+        <div style="font-size:12px;color:var(--inkMid)">點擊新增截圖 Tap to add（可重複）</div>
+        <input type="file" accept="image/*" multiple id="capimg" style="display:none">
       </div>
-      <div id="capimgprev"></div>
+      ${imgThumbs}
 
-      <div class="divider"></div>
-      <div class="field"><span class="label">Captured text 擷取內容</span>
-        <textarea data-cap="raw" rows="3" placeholder="Paste LINE / email / note 貼上訊息…">${esc(cap.raw)}</textarea></div>
-      <div class="field"><span class="label">Progress signal 進度訊號</span>
-        <select data-cap="signal">${["screenshot","chat","meeting","manual","import"].map(k=>`<option value="${k}" ${cap.signal===k?"selected":""}>${lbl(k)}</option>`).join("")}</select></div>
+      <div class="sect">Brief 快速理解</div>
+      <div class="field"><span class="label">① 發生什麼事？ What happened</span>
+        <textarea data-cap="q_what" rows="2" placeholder="一兩句話描述">${esc(cap.q_what)}</textarea></div>
+      <div class="field"><span class="label">② 是既有的還是新的？ Existing or new</span>
+        <div class="seg">
+          ${[["existing","既有"],["new","新的"]].map(([v,t])=>`<button data-cap-pick="q_kind" data-val="${v}" class="${cap.q_kind===v?"on":""}" style="${cap.q_kind===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
+        </div>
+      </div>
+      <div class="field"><span class="label">③ 球在誰手上？ Who has the ball</span>
+        <div class="seg">
+          ${[["me","我 Me"],["them","對方 Them"],["waiting","等待 Waiting"],["shared","共同 Shared"]].map(([v,t])=>`<button data-cap-pick="q_ball" data-val="${v}" class="${cap.q_ball===v?"on":""}" style="${cap.q_ball===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
+        </div>
+      </div>
+      <div class="field"><span class="label">④ 下一步是什麼？ Next action</span>
+        <input type="text" data-cap="q_next" value="${esc(cap.q_next)}" placeholder="例：等工廠回報價"></div>
 
-      <div class="sect">Classify 分類</div>
-      <div class="field"><span class="label">Resolution 分類去向</span>
-        <select data-cap="target">${targetOpts.map(([v,t])=>`<option value="${v}" ${cap.target===v?"selected":""}>${t}</option>`).join("")}</select></div>
+      <div class="sect">${S.advanced?"Classify 分類":"要放到哪？ Where does it go"}</div>
+      <div class="field">
+        <select data-cap="target">${targetOpts.map(([v,t])=>`<option value="${v}" ${cap.target===v?"selected":""}>${t}</option>`).join("")}</select>
+      </div>
       ${parentBlock}
-      ${titleBlock}
+      ${detailBlock}
       ${suggestBlock}
 
       <button class="btn btn-primary full" data-act="cap-commit" ${disabled?"disabled":""}>
-        ${cap.target==="suggest"?"Create Portfolio (confirm) 建立組合":"Resolve Capture 完成分類"}
+        ${cap.target==="suggest"?"建立新大事（確認）":(cap.target==="update"?"記錄進度":"建立並歸位")}
       </button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">User confirms all creation. AI only suggests. 所有建立由使用者確認。</div>
+      <div class="center muted" style="font-size:10px;margin-top:8px">由你確認，不自動建立。User confirms all creation.</div>
     </div>`;
   }
 
@@ -1068,6 +1310,7 @@
     S.importReport = null; S.importRaw = "";
     S.view = "portfolio";
     render();
+    maybeSync("import");
   }
   function viewImport(){
     const rep = S.importReport;
@@ -1142,6 +1385,72 @@
         <textarea data-imp="raw" rows="5" placeholder="title,type,parentTitle,summary&#10;新工作項,work,CD8260 背面 LOGO 版,測試">${esc(S.importRaw)}</textarea></div>
       <button class="btn btn-primary full" data-act="import-compute" ${!S.importRaw.trim()?"disabled":""}>Compute Diff 計算差異</button>
       ${reportBlock}
+    </div>`;
+  }
+
+  /* ─── SETTINGS (sync config) ───────────────────────────────────────────── */
+  function viewSettings(){
+    const connected = !!S.syncUrl;
+    return html`
+    ${topbar("設定 Settings","Google Sheets 同步")}
+    <div class="pad">
+      <div class="sect">雲端同步 Cloud Sync</div>
+      <div class="note-info" style="border-radius:var(--r);padding:12px 14px;margin-bottom:14px;font-size:11px;line-height:1.7">
+        把資料同步到你自己的 Google 試算表，跨裝置接續工作。同步是<b>同步層</b>，不是真相來源——Excel 匯出仍是備份。
+        Sync to your own Google Sheet for cross-device continuity. Sync is a layer, not the source of truth.
+      </div>
+
+      <div class="card" style="padding:14px;margin-bottom:14px">
+        <div class="field">
+          <span class="label">Apps Script Web App 網址 URL</span>
+          <input type="text" data-set="url" value="${esc(S.settingsUrlDraft||S.syncUrl||"")}" placeholder="https://script.google.com/macros/s/…/exec">
+        </div>
+        <div class="field">
+          <span class="label">這台裝置名稱 Device name</span>
+          <input type="text" data-set="dev" value="${esc(S.settingsDevDraft||S.syncDevice||"")}" placeholder="iPhone / 筆電 Laptop">
+        </div>
+        <div class="flex gap8">
+          <button class="btn btn-secondary" style="flex:1" data-act="sync-save">儲存設定</button>
+          ${connected?`<button class="btn btn-ghost" style="flex:1" data-act="sync-clear">清除</button>`:""}
+        </div>
+      </div>
+
+      ${connected?`
+      <div class="card" style="padding:14px;margin-bottom:14px">
+        <div class="flex between aic mb10">
+          <span class="label" style="margin:0">狀態 Status</span>
+          <span style="font-size:11px;color:${S.syncStatus==='error'?'var(--clay)':'var(--moss)'}">${esc(syncLabel())}</span>
+        </div>
+        <div class="flex gap8">
+          <button class="btn btn-moss" style="flex:1" data-act="sync-push">⤴ 上傳到雲端</button>
+          <button class="btn btn-slate" style="flex:1" data-act="sync-pull">⤵ 從雲端載入</button>
+        </div>
+        <div class="muted" style="font-size:10px;margin-top:8px;line-height:1.6">
+          上傳＝把這台的資料存到雲端；載入＝把雲端資料抓下來覆蓋這台。單人使用，後存的為準。
+        </div>
+      </div>`:""}
+
+      <div class="sect">怎麼設定？ Setup</div>
+      <div class="card" style="padding:14px">
+        <ol style="margin:0;padding-left:18px;font-size:12px;color:var(--inkMid);line-height:1.9">
+          <li>開一個新的 Google 試算表（專給 PMO OS）</li>
+          <li>擴充功能 → Apps Script，貼上我給你的後端程式碼</li>
+          <li>部署 → 新增部署 → 類型「網頁應用程式」</li>
+          <li>「誰可以存取」選「<b>任何人</b>」→ 部署 → 複製網址</li>
+          <li>把網址貼到上面欄位 → 儲存設定 → 按「上傳到雲端」</li>
+        </ol>
+        <div class="muted" style="font-size:10px;margin-top:10px">跟你估價系統同樣的 Apps Script 做法。</div>
+      </div>
+    </div>`;
+  }
+
+  /* ─── sync status bar (shown atop Daily) ───────────────────────────────── */
+  function syncBar(){
+    if(!S.syncUrl) return "";
+    const err = S.syncStatus==="error";
+    return `<div class="flex between aic" style="padding:6px 18px;background:${err?'var(--clayBg)':'var(--bgMuted)'};font-size:10px;color:${err?'var(--clay)':'var(--inkMid)'};border-bottom:1px solid var(--border)">
+      <span>☁ ${esc(syncLabel())}</span>
+      <button class="btn btn-ghost" style="padding:2px 8px;font-size:10px" data-act="sync-push">立即同步</button>
     </div>`;
   }
 
@@ -1245,8 +1554,13 @@
 
     // click delegation
     root.onclick = e => {
-      const t = e.target.closest("[data-act]");
+      const t = e.target.closest("[data-act],[data-cap-pick]");
       if(!t) return;
+      // segmented brief pickers
+      if(t.hasAttribute("data-cap-pick")){
+        cap[t.getAttribute("data-cap-pick")] = t.getAttribute("data-val");
+        render(); return;
+      }
       const act = t.getAttribute("data-act");
       switch(act){
         case "login": S.role=t.getAttribute("data-role"); S.view="daily"; render(); break;
@@ -1262,11 +1576,24 @@
         case "toggle": { const id=t.getAttribute("data-id"); S.expanded[id]=!S.expanded[id]; render(); e.stopPropagation(); break; }
         case "pf": S.pfFilter=t.getAttribute("data-state"); render(); break;
         case "workstatus": setWorkStatus(t.getAttribute("data-id"), t.getAttribute("data-status")); break;
+        case "toggle-advanced": S.advanced=!S.advanced; render(); break;
+        case "pin": doPin(t.getAttribute("data-id")); break;
+        case "w-done": wDone(t.getAttribute("data-id")); break;
+        case "w-delay": wDelay(t.getAttribute("data-id")); break;
+        case "w-block": wBlockStart(t.getAttribute("data-id")); break;
+        case "w-more": wMore(t.getAttribute("data-id")); break;
+        case "blk-save": wBlockSave(); break;
+        case "blk-cancel": S.blockFor=null; render(); break;
+        case "sync-save": syncSaveSettings(); break;
+        case "sync-clear": syncClearSettings(); break;
+        case "sync-push": syncPush("manual"); break;
+        case "sync-pull": if(confirm("從雲端載入會以雲端資料為準，覆蓋這台未上傳的變更。確定？")) syncPull({alert:true}); break;
         case "set-maturity": setMaturity(t.getAttribute("data-val")); break;
         case "toggle-transform": det.showTransform=!det.showTransform; render(); break;
         case "transform": doTransform(t.getAttribute("data-to"), t.getAttribute("data-freeze")==="1"); break;
         case "addlog": addLog(); break;
         case "cap-commit": capCommit(); break;
+        case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
         case "pickimg": document.getElementById("capimg").click(); break;
         case "pickfile": document.getElementById("importfile").click(); break;
         case "import-mode": S.importMode=t.getAttribute("data-mode"); S.importReport=null; render(); break;
@@ -1291,6 +1618,8 @@
         return;
       }
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; return; }
+      if(el.hasAttribute("data-blk")){ S.blockText = el.value; return; }
+      if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
         if(btn) btn.disabled = !S.importRaw.trim();
@@ -1308,7 +1637,7 @@
     root.onchange = e => {
       const el = e.target;
       if(el.hasAttribute("data-cap-check")){ cap[el.getAttribute("data-cap-check")] = el.checked; render(); return; }
-      if(el.id==="capimg"){ handleCapImg(el.files[0]); return; }
+      if(el.id==="capimg"){ handleCapImg(el.files); return; }
       if(el.id==="importfile"){ handleImportFile(el.files[0]); return; }
     };
   }
@@ -1316,6 +1645,62 @@
   /* ─── actions ──────────────────────────────────────────────────────────── */
   function setWorkStatus(id, s){
     S.nodes = S.nodes.map(n=>n.id===id?Object.assign({},n,{workStatus:s,lastUpdated:todayStr(),lastProgress:todayStr(),progressSignal:"manual"}):n);
+    render();
+  }
+  function updateNode(id, fn){
+    S.nodes = S.nodes.map(n=>n.id===id?fn(Object.assign({},n)):n);
+  }
+  function doPin(id){
+    updateNode(id, n=>{ n.tags=togglePin(n); return n; });
+    render();
+  }
+  // ✅ 完成 — mark done, advance progress, clear blocker tag, suggest downstream OR auto-advance
+  function wDone(id){
+    updateNode(id, n=>{
+      n.workStatus="done"; n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
+      n.tags=(n.tags||[]).filter(x=>x.indexOf("🚧")!==0); // clear blocker
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"✅ 完成 done"});
+      return n;
+    });
+    render(); // momentum: list re-sorts, next item surfaces automatically (no "stop today?" prompt)
+    maybeSync("done");
+  }
+  // ⏸ 延後 — pause: mark with a soft tag so it isn't treated as overdue; stays in progress
+  function wDelay(id){
+    updateNode(id, n=>{
+      n.lastUpdated=todayStr();
+      const tags=(n.tags||[]).filter(x=>x!=="⏸延後");
+      tags.push("⏸延後");
+      n.tags=tags;
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"⏸ 延後 deferred"});
+      return n;
+    });
+    render();
+  }
+  // ➕ 做更多 — bump as worked-on today (advance progress) and pin to keep visible
+  function wMore(id){
+    updateNode(id, n=>{
+      n.workStatus="doing"; n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
+      if((n.tags||[]).indexOf(TAG_PIN)<0) n.tags=(n.tags||[]).concat(TAG_PIN);
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"➕ 做更多 more"});
+      return n;
+    });
+    render();
+  }
+  // 🚧 卡住 — open a tiny blocker note inline
+  function wBlockStart(id){ S.blockFor=id; S.blockText=""; render(); }
+  function wBlockSave(){
+    const id=S.blockFor; if(!id) return;
+    const text=(S.blockText||"").trim();
+    updateNode(id, n=>{
+      n.lastUpdated=todayStr();
+      const tags=(n.tags||[]).filter(x=>x.indexOf("🚧")!==0);
+      tags.push("🚧:"+ (text||"卡住"));
+      n.tags=tags;
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"🚧 卡住："+(text||"(未填)")});
+      return n;
+    });
+    S.blockFor=null; S.blockText="";
     render();
   }
   function setMaturity(val){
@@ -1371,40 +1756,67 @@
     const btn = document.querySelector('[data-act="cap-commit"]');
     if(btn) btn.disabled = capCommitDisabled();
   }
+  // assemble a readable summary from the Brief answers + raw text
+  function capSummary(){
+    const ballMap={me:"球在我",them:"球在對方",waiting:"等待中",shared:"共同"};
+    const bits=[];
+    if(cap.q_what) bits.push(cap.q_what);
+    if(cap.q_ball) bits.push("【"+(ballMap[cap.q_ball]||cap.q_ball)+"】");
+    if(cap.q_next) bits.push("下一步："+cap.q_next);
+    if(cap.raw) bits.push(cap.raw);
+    return bits.join(" / ");
+  }
+  function capResetForm(){
+    cap.raw=""; cap.target=""; cap.parentId=""; cap.title=""; cap.so=false; cap.sd=false; cap.sr=false; cap.mode="explore"; cap.signal="screenshot";
+    cap.images=[]; cap.q_what=""; cap.q_kind=""; cap.q_ball=""; cap.q_next=""; cap.caseNo=""; cap.dday="";
+  }
   function capCommit(){
     const now = todayStr();
     const ns = S.nodes;
+    const summary = capSummary();
+    const att = cap.images.map((src,i)=>({id:uid("att"),kind:"image",src,added:now}));
+    const briefLog = { id:uid("log"), date:now, signal:cap.signal,
+      content:"📥 "+(summary||"capture")+(cap.images.length?` (${cap.images.length}張截圖)`:"") };
+
     if(cap.target==="update"){
       S.nodes = ns.map(n=>n.id===cap.parentId?Object.assign({},n,{
-        logs:(n.logs||[]).concat({id:uid("log"),date:now,signal:cap.signal,content:cap.raw}),
+        logs:(n.logs||[]).concat(briefLog),
+        attachments:(n.attachments||[]).concat(att),
         lastUpdated:now, lastProgress:now, progressSignal:cap.signal
       }):n);
     } else {
       let node;
-      if(cap.target==="work")    node={id:uid("wk"),type:"work",parentType:"branch",parentId:cap.parentId,title:cap.title,summary:cap.raw,workStatus:"todo",owner:"",firstSuccessEvent:"",deadline:null};
-      if(cap.target==="branch")  node={id:uid("br"),type:"branch",parentType:"project",parentId:cap.parentId,title:cap.title,summary:cap.raw,executionStage:"ready",channel:"",firstSuccessEvent:"",deadline:null};
-      if(cap.target==="project") node={id:uid("pr"),type:"project",parentType:"portfolio",parentId:cap.parentId,title:cap.title,summary:cap.raw,executionStage:"ready",stakeholders:[],firstSuccessEvent:"",deadline:null};
-      if(cap.target==="suggest") node={id:uid("p"),type:"portfolio",parentType:null,parentId:null,title:cap.title,summary:cap.raw,portfolioState:"inbox",projectMode:cap.mode||"explore"};
-      node = Object.assign(node, { tags:[], lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
-        logs:[{id:uid("log"),date:now,signal:cap.signal,content:cap.raw||"created from capture"}], attachments:[] });
+      if(cap.target==="work")    node={id:uid("wk"),type:"work",parentType:"branch",parentId:cap.parentId,title:cap.title,summary,workStatus:"todo",owner:(cap.q_ball==="them"?"them":(cap.q_ball==="me"?"me":"")),firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
+      if(cap.target==="branch")  node={id:uid("br"),type:"branch",parentType:"project",parentId:cap.parentId,title:cap.title,summary,executionStage:"ready",channel:"",firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
+      if(cap.target==="project") node={id:uid("pr"),type:"project",parentType:"portfolio",parentId:cap.parentId,title:cap.title,summary,executionStage:"ready",stakeholders:[],firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
+      if(cap.target==="suggest") node={id:uid("p"),type:"portfolio",parentType:null,parentId:null,title:cap.title,summary,portfolioState:"inbox",projectMode:cap.mode||"explore"};
+      // tags: case no + dday (schema unchanged; encoded as tags)
+      let tags=[];
+      if(cap.caseNo) tags.push(TAG_CASE+cap.caseNo);
+      if(cap.dday && cap.target!=="suggest") tags.push(TAG_DDAY+cap.dday);
+      node = Object.assign(node, { tags, lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
+        logs:[briefLog], attachments:att });
       S.nodes = ns.concat(node);
     }
-    // reset capture form
-    cap.raw=""; cap.target=""; cap.parentId=""; cap.title=""; cap.so=false; cap.sd=false; cap.sr=false; cap.mode="explore"; cap.signal="screenshot";
-    S.view="portfolio";
+    capResetForm();
+    S.view="daily"; // back to the work list — momentum
     render();
+    maybeSync("capture");
   }
-  function handleCapImg(file){
-    if(!file || !file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const prev = document.getElementById("capimgprev");
-      if(prev) prev.innerHTML = `<div style="margin-top:8px;border:1px solid var(--border);border-radius:var(--r);overflow:hidden">
-        <img src="${ev.target.result}" style="width:100%;display:block;max-height:140px;object-fit:cover"></div>`;
-      cap.raw = (cap.raw?cap.raw+"\n":"") + `[screenshot ${file.name}] — manual fill (OCR deferred)`;
-      const ta = document.querySelector('[data-cap="raw"]'); if(ta) ta.value = cap.raw;
-    };
-    reader.readAsDataURL(file);
+  function handleCapImg(files){
+    const list = files && files.length ? Array.from(files) : (files?[files]:[]);
+    let pending = list.length;
+    if(!pending) return;
+    list.forEach(file=>{
+      if(!file || !file.type.startsWith("image/")){ pending--; return; }
+      const reader = new FileReader();
+      reader.onload = ev => {
+        cap.images.push(ev.target.result);
+        pending--;
+        if(pending<=0) render();
+      };
+      reader.readAsDataURL(file);
+    });
   }
   async function handleImportFile(file){
     if(!file) return;
@@ -1425,4 +1837,5 @@
   /* ─── boot ─────────────────────────────────────────────────────────────── */
   load();
   render();
+  if(S.syncUrl) startAutoSync();
 })();
