@@ -15,8 +15,8 @@
 
   /* ─── bilingual labels ─────────────────────────────────────────────────── */
   const L = {
-    capture:"Capture 擷取", portfolio:"Portfolio 組合", project:"Project 專案",
-    branch:"Branch 支線", work:"Work 工作項",
+    capture:"Capture 擷取", portfolio:"Account 對象", project:"Project 專案",
+    branch:"Branch 工項", work:"Work 待辦",
     inbox:"Inbox 收件匣", incubator:"Incubator 孵化", active:"Active 進行中",
     frozen:"Frozen 凍結", archived:"Archived 封存",
     ready:"Ready 就緒", developing:"Developing 進行", blocked:"Blocked 受阻", complete:"Complete 完成",
@@ -398,7 +398,7 @@
   function rootPortfolio(ns,n){ let cur=n,g=0; while(cur&&cur.parentId&&g++<6){ cur=byId(ns,cur.parentId); } return cur; }
 
   // ── friendly (non-architecture) labels for default mode ──────────────────────
-  const FRIENDLY = { portfolio:"大事 Big Thing", project:"交付 Deliverable", branch:"路線 Route", work:"下一步 Next Action" };
+  const FRIENDLY = { portfolio:"對象 Account", project:"專案 Project", branch:"工項 Branch", work:"待辦 Work" };
   function typeWord(t){ return S.advanced ? lbl(t) : (FRIENDLY[t]||t); }
 
   // ── hierarchy code: portfolio=letter(A,B,…), project=A.1, branch=A.1.a, work=A.1.a.i ──
@@ -438,6 +438,7 @@
     advanced:false,     // UX: hide architecture terms by default
     blockFor:null,      // work id whose blocker note is being entered
     blockText:"",
+    moveFor:null,       // node id being re-parented (移動到…)
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -451,11 +452,12 @@
 
   // ── tag-encoded metadata (schema unchanged: stored as special tags) ──────────
   // case number  → tag "案號:XXX"     D-DAY → tag "DDAY:YYYY-MM-DD"   pin → tag "PIN"
-  const TAG_CASE = "案號:", TAG_DDAY = "DDAY:", TAG_PIN = "PIN";
+  const TAG_CASE = "案號:", TAG_DDAY = "DDAY:", TAG_PIN = "PIN", TAG_LINK = "連結:";
   function getCaseNo(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_CASE)===0); return t?t.slice(TAG_CASE.length):""; }
   function getDday(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_DDAY)===0); return t?t.slice(TAG_DDAY.length):""; }
+  function getLink(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_LINK)===0); return t?t.slice(TAG_LINK.length):""; }
   function isPinned(n){ return (n.tags||[]).indexOf(TAG_PIN)>-1; }
-  function visibleTags(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_CASE)!==0&&x.indexOf(TAG_DDAY)!==0&&x!==TAG_PIN); }
+  function visibleTags(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_CASE)!==0&&x.indexOf(TAG_DDAY)!==0&&x.indexOf(TAG_LINK)!==0&&x!==TAG_PIN); }
   function setTagKV(n, prefix, value){
     let tags=(n.tags||[]).filter(x=>x.indexOf(prefix)!==0);
     if(value) tags.push(prefix+value);
@@ -630,7 +632,7 @@
       default:          screen = viewDaily();
     }
     const nav = S.view==="detail" ? "" : bottomNav();
-    const overlay = S.blockFor ? blockerModalHtml() : "";
+    const overlay = S.blockFor ? blockerModalHtml() : (S.moveFor ? moveModalHtml() : "");
     root.innerHTML = `<div class="screen">${screen}</div>${nav}${overlay}`;
     bind();
   }
@@ -703,8 +705,8 @@
   }
   function bottomNav(){
     const items = S.role==="factory"
-      ? [["daily","Daily 焦點","☀"],["portfolio","Portfolio 組合","◉"],["export","Export 匯出","⤓"],["settings","設定","⚙"]]
-      : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","Portfolio 組合","◉"],
+      ? [["daily","Daily 焦點","☀"],["portfolio","對象","◉"],["export","Export 匯出","⤓"],["settings","設定","⚙"]]
+      : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","對象","◉"],
          ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"],["settings","設定","⚙"]];
     return `<nav class="bottomnav">` + items.map(([id,label,ic])=>`
       <button data-act="nav" data-view="${id}" class="${S.view===id?"on":""}">
@@ -734,21 +736,30 @@
       <button class="btn btn-ghost sm" data-act="toggle-advanced" title="切換進階">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>
       <button class="btn btn-ghost sm" data-act="logout">切換 →</button>`;
 
-    // group by big-thing (root portfolio) so it reads like the daily report
+    // group by big-thing (root portfolio); ORDER groups by their most-urgent (earliest D-DAY)
+    // item so a newly-added urgent 待辦 floats its account to the top, regardless of entry order.
     const groups = {};
     sorted.forEach(w=>{ const r=rootPortfolio(ns,w); const k=r?r.id:"_"; (groups[k]=groups[k]||[]).push(w); });
+    const groupKeys = Object.keys(groups).sort((ka,kb)=>{
+      const a=groups[ka], b=groups[kb];
+      // pinned item anywhere in group lifts it
+      const pa = a.some(isPinned)?0:1, pb = b.some(isPinned)?0:1;
+      if(pa!==pb) return pa-pb;
+      const ma = Math.min.apply(null, a.map(dval));  // earliest D-DAY in group
+      const mb = Math.min.apply(null, b.map(dval));
+      if(ma!==mb) return ma-mb;
+      return 0;
+    });
 
     let body = "";
     if(sorted.length===0){
       body = `<div class="empty">目前沒有進行中的工作 🎉<br><span style="font-size:11px">No work in progress.</span></div>`;
     } else {
-      Object.keys(groups).forEach(gid=>{
+      groupKeys.forEach(gid=>{
         const root = gid==="_"?null:byId(ns,gid);
-        const caseNo = root?getCaseNo(root):"";
         const head = root
           ? `<div class="flex aic gap8" style="margin:14px 2px 8px">
                <span style="font-size:12px;font-weight:700;color:var(--moss)">${S.advanced?"":(codes[root.id]+" ")}${esc(root.title)}</span>
-               ${caseNo?`<span class="tag" style="background:var(--slateBg);color:var(--slate)">#${esc(caseNo)}</span>`:""}
                ${S.advanced?`<span class="tag">${lbl("portfolio")}</span>`:""}
              </div>`
           : "";
@@ -787,10 +798,10 @@
             <span style="font-size:14px;font-weight:600">${esc(w.title)}</span>
           </div>
           <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
-            ${getCaseNo(w)?`<span class="tag" style="background:var(--slateBg);color:var(--slate)">#${esc(getCaseNo(w))}</span>`:""}
             ${w.owner?`<span>負責 ${esc(w.owner)}</span>`:""}
             ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`:`<span>交期未定</span>`}
             ${stale?`<span class="badge-stale">⏱ ${daysSince(w.lastProgress)}d</span>`:""}
+            ${getLink(w)?`<a class="wlink" href="${esc(getLink(w))}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
           </div>
           ${blockTag?`<div style="margin-top:6px;font-size:11px;color:var(--clay);background:var(--clayBg);border-radius:var(--rsm);padding:5px 8px">🚧 ${esc(blockTag.slice(2).replace(/^:/,''))}</div>`:""}
         </div>
@@ -824,81 +835,140 @@
     </div>`;
   }
 
+  // 移動到… modal: pick a new parent of the correct type
+  function moveModalHtml(){
+    const ns = S.nodes;
+    const node = byId(ns, S.moveFor);
+    if(!node) return "";
+    const codes = buildCodes(ns);
+    // valid new parents by child type
+    const parentType = { work:"branch", branch:"project", project:"portfolio" }[node.type];
+    if(!parentType){ // portfolio can't be re-parented
+      return `<div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
+        <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px">
+          <div class="flex between aic mb10"><div style="font-family:'Lora',serif;font-size:16px">搬移</div><button class="back" data-act="move-cancel">×</button></div>
+          <div class="muted" style="font-size:12px">對象（最上層）不能搬移到別人底下。</div>
+          <button class="btn btn-ghost full mt14" data-act="move-cancel">關閉</button>
+        </div></div>`;
+    }
+    const candidates = ns.filter(n=>n.type===parentType && !n.mergeIntoId && n.id!==node.parentId);
+    const word = { branch:"工項", project:"專案", portfolio:"對象" }[parentType];
+    const rows = candidates.length
+      ? candidates.map(c=>`<button class="btn btn-secondary full mb6" style="justify-content:flex-start" data-act="move-to" data-pid="${c.id}">
+           ${codes[c.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[c.id]}</span> `:""}${esc(c.title)}
+         </button>`).join("")
+      : `<div class="muted" style="font-size:12px;padding:8px 0">沒有其他可放的${word}。</div>`;
+    return html`
+    <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
+      <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd);max-height:80vh;overflow:auto">
+        <div class="flex between aic mb10">
+          <div style="font-family:'Lora',serif;font-size:16px">搬移「${esc(node.title)}」到哪個${word}？</div>
+          <button class="back" data-act="move-cancel">×</button>
+        </div>
+        <div class="muted" style="font-size:11px;margin-bottom:10px">選一個新的上層，確認後就會搬過去（歷程保留）。</div>
+        ${rows}
+        <button class="btn btn-ghost full mt8" data-act="move-cancel">取消</button>
+      </div>
+    </div>`;
+  }
+
   /* ─── CAPTURE ──────────────────────────────────────────────────────────── */
-  const cap = { raw:"", signal:"screenshot", target:"", parentId:"", title:"", so:false, sd:false, sr:false, mode:"explore",
-                images:[], q_what:"", q_kind:"", q_ball:"", q_next:"", caseNo:"", dday:"" };
+  // capture session state.
+  //  pick = { mode:'update'|'work'|'branch'|'project'|'account', parentId } chosen from tree
+  //  nexts = list of 待辦(work) titles when creating work (multiple)
+  const cap = { images:[], signal:"screenshot",
+                q_what:"", q_kind:"", q_ball:"", q_next:"",
+                nexts:[], link:"", dday:"", title:"", mode:"explore",
+                pick:null /* {mode,parentId} */ };
   function viewCapture(){
     const ns = S.nodes;
     const codes = buildCodes(ns);
-    const portfolios = ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
-    const projects   = ns.filter(n=>n.type==="project"&&!n.mergeIntoId);
-    const branches   = ns.filter(n=>n.type==="branch"&&!n.mergeIntoId);
-    const anyNode    = ns.filter(n=>["portfolio","project","branch","work"].includes(n.type)&&!n.mergeIntoId);
-    const parentChoices = { update:anyNode, work:branches, branch:projects, project:portfolios, suggest:[] }[cap.target] || [];
-    const mergeYes = [cap.so,cap.sd,cap.sr].filter(Boolean).length;
+    const right = `<button class="btn btn-ghost sm" data-act="toggle-advanced">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>`;
 
-    // friendly labels in default mode, real types in advanced
-    const targetOpts = [
-      ["","— 選擇 / choose —"],
-      ["update", S.advanced?"Update 更新 → append log":"記一筆進度 → 加到現有項目"],
-      ["work",   S.advanced?"Work 工作項 → under Branch":"新的下一步 → 放進某條路線"],
-      ["branch", S.advanced?"Branch 路線 → under Project":"新的路線 → 放進某個交付"],
-      ["project",S.advanced?"Project 交付 → under Portfolio":"新的交付 → 放進某件大事"],
-      ["suggest",S.advanced?"Suggest Portfolio":"開一件新的大事（少用）"],
-    ];
-
-    let parentBlock = "";
-    if(cap.target && cap.target!=="suggest"){
-      const lblTxt = cap.target==="update" ? "加到哪個項目 Attach to" : "歸到哪個上層 Parent";
-      parentBlock = html`
-        <div class="field">
-          <span class="label">${lblTxt}</span>
-          <select data-cap="parentId">
-            <option value="">— 選擇 select —</option>
-            ${parentChoices.map(n=>`<option value="${n.id}" ${cap.parentId===n.id?"selected":""}>${codes[n.id]?codes[n.id]+" ":""}${esc(n.title)}${S.advanced?" ["+lbl(n.type)+"]":""}</option>`).join("")}
-          </select>
-        </div>`;
-    }
-    let detailBlock = "";
-    if(cap.target && cap.target!=="update" && cap.target!=="suggest"){
-      detailBlock = html`
-        <div class="field"><span class="label">標題 Title</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="這個項目叫什麼"></div>
-        <div class="row2">
-          <div class="field"><span class="label">案號 Case No.（選填）</span><input type="text" data-cap="caseNo" value="${esc(cap.caseNo)}" placeholder="DP706…"></div>
-          <div class="field"><span class="label">交期 D-DAY（可留空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
-        </div>`;
-    }
-    let suggestBlock = "";
-    if(cap.target==="suggest"){
-      suggestBlock = html`
-      <div class="card" style="background:var(--bambooBg);border-color:rgba(184,168,120,.4);padding:14px;margin-bottom:12px">
-        <span class="label">先確認：真的需要一件新大事嗎？Merge check（≥2 → 建議併入既有）</span>
-        ${[["so","有共同成果？ Shared outcome"],["sd","有共同交期？ Shared deadline"],["sr","有共用資源？ Shared resources"]].map(([k,t])=>`
-          <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--inkMid);padding:4px 0">
-            <input type="checkbox" data-cap-check="${k}" ${cap[k]?"checked":""}> ${t}
-          </label>`).join("")}
-        ${mergeYes>=2
-          ? `<div style="font-size:11px;color:var(--clay);font-weight:600;margin-top:8px">⚠ ≥2 → 建議併入既有大事，而非新開。</div>`
-          : `<div style="font-size:11px;color:var(--moss);margin-top:8px">&lt;2 → 可以開一件新大事。</div>`}
-        <div class="field mt8"><span class="label">大事名稱 Big-thing title</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="例：某客戶新合作"></div>
-        <div class="field"><span class="label">模式 Mode</span>
-          <select data-cap="mode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.mode===m?"selected":""}>${S.advanced?lbl(m):({deliver:"要交付的",build:"要建構的",explore:"要探索的"}[m])}</option>`).join("")}</select>
-        </div>
-      </div>`;
-    }
-
-    const disabled = capCommitDisabled();
     const imgThumbs = cap.images.length
       ? `<div class="flex gap6 wrap" style="margin-top:8px">${cap.images.map((src,i)=>`<div style="position:relative"><img src="${src}" style="width:64px;height:64px;object-fit:cover;border-radius:var(--rsm);border:1px solid var(--border)"><button data-act="cap-rmimg" data-idx="${i}" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--clay);color:#fff;border:none;font-size:11px">×</button></div>`).join("")}</div>`
       : "";
 
-    const right = `<button class="btn btn-ghost sm" data-act="toggle-advanced">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>`;
+    // ── tree picker: every node is a target; each level offers "add child here" ──
+    const pick = cap.pick;
+    function pickedLabel(){
+      if(!pick) return "";
+      if(pick.mode==="account") return "➕ 新對象（Account）";
+      const p = byId(ns, pick.parentId);
+      const childWord = { update:"記一筆進度到", work:"新待辦於", branch:"新工項於", project:"新專案於" }[pick.mode];
+      return `${childWord}：${p?(codes[p.id]?codes[p.id]+" ":"")+p.title:""}`;
+    }
+    function treeNode(n, depth){
+      const indent = depth*14;
+      const kids = childrenOf(ns,n.id);
+      let addBtn = "";
+      // what child can this node accept?
+      const childMode = { portfolio:"project", project:"branch", branch:"work" }[n.type];
+      const childWord = { project:"➕新專案", branch:"➕新工項", work:"➕新待辦" }[childMode];
+      const isPickedAdd = pick && pick.mode===childMode && pick.parentId===n.id;
+      const isPickedUpd = pick && pick.mode==="update" && pick.parentId===n.id;
+      let out = `
+        <div style="margin-left:${indent}px;display:flex;align-items:center;gap:6px;padding:3px 0">
+          <button class="btn ${isPickedUpd?'btn-moss':'btn-ghost'}" style="padding:3px 8px;font-size:11px;flex:1;justify-content:flex-start;text-align:left"
+            data-act="cap-pick" data-mode="update" data-pid="${n.id}">
+            ${codes[n.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[n.id]}</span> `:""}${esc(n.title)}
+          </button>
+          ${childMode?`<button class="btn ${isPickedAdd?'btn-moss':'btn-secondary'}" style="padding:3px 8px;font-size:10px;white-space:nowrap" data-act="cap-pick" data-mode="${childMode}" data-pid="${n.id}">${childWord}</button>`:""}
+        </div>`;
+      kids.forEach(k=>{ out += treeNode(k, depth+1); });
+      return out;
+    }
+    const accounts = ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
+    const treeHtml = accounts.map(a=>treeNode(a,0)).join("") || `<div class="muted" style="font-size:11px;padding:8px 0">目前沒有對象，請先開一個。</div>`;
+
+    // ── detail block depends on the chosen pick mode ──
+    let detailBlock = "";
+    if(pick){
+      if(pick.mode==="work"){
+        // multiple 待辦
+        const chips = cap.nexts.map((t,i)=>`<div class="flex aic gap6" style="margin-bottom:4px"><span class="tag" style="flex:1;text-align:left">${esc(t)}</span><button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="cap-rmnext" data-idx="${i}">×</button></div>`).join("");
+        detailBlock = html`
+          <div class="card" style="padding:12px;margin-top:12px">
+            <span class="label">待辦清單（可多筆 Work items）</span>
+            ${chips || `<div class="muted" style="font-size:11px;margin-bottom:6px">至少加一筆。或直接用上面「下一步」的內容。</div>`}
+            <div class="flex gap6">
+              <input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="一個待辦動作" style="flex:1">
+              <button class="btn btn-secondary" data-act="cap-addnext">＋ 加待辦</button>
+            </div>
+            <div class="row2 mt10">
+              <div class="field"><span class="label">交期 D-DAY（可空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
+              <div class="field"><span class="label">連結（可空）</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://…"></div>
+            </div>
+          </div>`;
+      } else if(pick.mode==="update"){
+        detailBlock = html`<div class="note-muted" style="border-radius:var(--rsm);padding:10px 12px;margin-top:12px;font-size:11px">這筆會以「發生什麼事」記成一條進度（並同步記到所屬對象的歷程）。</div>`;
+      } else if(pick.mode==="account"){
+        detailBlock = html`
+          <div class="card" style="padding:12px;margin-top:12px">
+            <div class="field"><span class="label">對象名稱 Account</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="例：某客戶 / 某計畫"></div>
+            <div class="field"><span class="label">類型 Mode</span>
+              <select data-cap="mode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.mode===m?"selected":""}>${S.advanced?lbl(m):({deliver:"要交付的",build:"要建構的",explore:"要探索的"}[m])}</option>`).join("")}</select></div>
+          </div>`;
+      } else { // branch / project
+        const word = pick.mode==="project"?"專案":"工項";
+        detailBlock = html`
+          <div class="card" style="padding:12px;margin-top:12px">
+            <div class="field"><span class="label">${word}名稱</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="這個${word}叫什麼"></div>
+            <div class="row2">
+              <div class="field"><span class="label">交期 D-DAY（可空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
+              <div class="field"><span class="label">連結（可空）</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://…"></div>
+            </div>
+          </div>`;
+      }
+    }
+
+    const disabled = capCommitDisabled();
 
     return html`
     ${topbar("Capture 擷取", `${cap.images.length} 張截圖 · 一個 session`, right)}
     <div class="pad">
       <div class="note-muted" style="border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:11px;line-height:1.6">
-        一次可放多張截圖（同一段對話）。先簡單回答幾個問題，再決定歸到哪。Multiple screenshots = one session.
+        一次可放多張截圖（同一段對話）。先回答幾個問題，再從下面的結構點一個位置放。
       </div>
 
       <span class="label">截圖 Screenshots（可多張）</span>
@@ -910,53 +980,89 @@
       ${imgThumbs}
 
       <div class="sect">Brief 快速理解</div>
-      <div class="field"><span class="label">① 發生什麼事？ What happened</span>
+      <div class="field"><span class="label">① 發生什麼事？（會記成對象的歷程 log）</span>
         <textarea data-cap="q_what" rows="2" placeholder="一兩句話描述">${esc(cap.q_what)}</textarea></div>
-      <div class="field"><span class="label">② 是既有的還是新的？ Existing or new</span>
+      <div class="field"><span class="label">② 是既有的還是新的？</span>
         <div class="seg">
           ${[["existing","既有"],["new","新的"]].map(([v,t])=>`<button data-cap-pick="q_kind" data-val="${v}" class="${cap.q_kind===v?"on":""}" style="${cap.q_kind===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
         </div>
       </div>
-      <div class="field"><span class="label">③ 球在誰手上？ Who has the ball</span>
+      <div class="field"><span class="label">③ 球在誰手上？</span>
         <div class="seg">
-          ${[["me","我 Me"],["them","對方 Them"],["waiting","等待 Waiting"],["shared","共同 Shared"]].map(([v,t])=>`<button data-cap-pick="q_ball" data-val="${v}" class="${cap.q_ball===v?"on":""}" style="${cap.q_ball===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
+          ${[["me","我"],["them","對方"],["waiting","等待"],["shared","共同"]].map(([v,t])=>`<button data-cap-pick="q_ball" data-val="${v}" class="${cap.q_ball===v?"on":""}" style="${cap.q_ball===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
         </div>
       </div>
-      <div class="field"><span class="label">④ 下一步是什麼？ Next action</span>
+      <div class="field"><span class="label">④ 下一步是什麼？（建待辦時可當第一筆）</span>
         <input type="text" data-cap="q_next" value="${esc(cap.q_next)}" placeholder="例：等工廠回報價"></div>
 
-      <div class="sect">${S.advanced?"Classify 分類":"要放到哪？ Where does it go"}</div>
-      <div class="field">
-        <select data-cap="target">${targetOpts.map(([v,t])=>`<option value="${v}" ${cap.target===v?"selected":""}>${t}</option>`).join("")}</select>
+      <div class="sect">要放到哪？（點結構裡的位置）</div>
+      <div class="card" style="padding:10px 12px">
+        <button class="btn ${pick&&pick.mode==='account'?'btn-moss':'btn-secondary'} full mb8" style="justify-content:flex-start" data-act="cap-pick" data-mode="account" data-pid="">➕ 開一個全新的對象（Account）</button>
+        <div style="max-height:260px;overflow:auto">${treeHtml}</div>
       </div>
-      ${parentBlock}
+      ${pick?`<div class="note-muted" style="border-radius:var(--rsm);padding:8px 12px;margin-top:10px;font-size:11px;color:var(--moss)">已選：${esc(pickedLabel())}</div>`:""}
       ${detailBlock}
-      ${suggestBlock}
 
-      <button class="btn btn-primary full" data-act="cap-commit" ${disabled?"disabled":""}>
-        ${cap.target==="suggest"?"建立新大事（確認）":(cap.target==="update"?"記錄進度":"建立並歸位")}
+      <button class="btn btn-primary full mt14" data-act="cap-commit" ${disabled?"disabled":""}>
+        ${pick&&pick.mode==="account"?"建立對象（確認）":pick&&pick.mode==="update"?"記錄進度":"建立並歸位"}
       </button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">由你確認，不自動建立。User confirms all creation.</div>
+      <div class="center muted" style="font-size:10px;margin-top:8px">由你確認，不自動建立。</div>
     </div>`;
   }
 
   /* ─── PORTFOLIO ────────────────────────────────────────────────────────── */
+  // roll up descendant 待辦(work) status: done ✅ / blocked 🚧 / pending ⏳
+  function statusRollup(ns, nodeId){
+    let done=0, blocked=0, pending=0;
+    function walk(id){
+      childrenOf(ns,id).forEach(c=>{
+        if(c.type==="work"){
+          if(c.workStatus==="done") done++;
+          else if((c.tags||[]).some(t=>t.indexOf("🚧")===0)) blocked++;
+          else pending++;
+        }
+        walk(c.id);
+      });
+    }
+    walk(nodeId);
+    return { done, blocked, pending };
+  }
+  function rollupBadges(r){
+    if(r.done+r.blocked+r.pending===0) return "";
+    const parts=[];
+    if(r.blocked) parts.push(`<span style="color:var(--clay)">🚧${r.blocked}</span>`);
+    if(r.pending) parts.push(`<span style="color:var(--bamboo)">⏳${r.pending}</span>`);
+    if(r.done) parts.push(`<span style="color:var(--moss)">✅${r.done}</span>`);
+    return `<span class="flex aic gap6" style="font-size:10px;font-weight:700">${parts.join("")}</span>`;
+  }
+  // sort siblings: more blocked first, then more pending
+  function byBlocked(ns){
+    return (a,b)=>{
+      const ra=statusRollup(ns,a.id), rb=statusRollup(ns,b.id);
+      if(rb.blocked!==ra.blocked) return rb.blocked-ra.blocked;
+      if(rb.pending!==ra.pending) return rb.pending-ra.pending;
+      return 0;
+    };
+  }
   function nodeRowHtml(node, ns, depth){
-    const kids = childrenOf(ns,node.id);
+    const kids = childrenOf(ns,node.id).slice().sort(byBlocked(ns));
     const hasKids = kids.length>0;
     const indent = depth*16;
+    const roll = node.type!=="work" ? statusRollup(ns,node.id) : null;
     const toggle = hasKids
       ? `<button class="tree-toggle" data-act="toggle" data-id="${node.id}">${S.expanded[node.id]?"▾":"▸"}</button>`
       : `<span style="width:14px;flex-shrink:0"></span>`;
+    // a work that is itself blocked shows 🚧
+    const selfBlocked = node.type==="work" && (node.tags||[]).some(t=>t.indexOf("🚧")===0);
     let out = html`
       <div class="node-row" style="margin-left:${indent}px;border-left:3px solid ${TYPE_CFG[node.type].c}" data-act="open" data-id="${node.id}">
         ${toggle}
         <div class="grow">
-          <div class="title">${esc(node.title)}</div>
+          <div class="title">${selfBlocked?"🚧 ":""}${esc(node.title)}</div>
           ${node.firstSuccessEvent?`<div class="sub">→ ${esc(node.firstSuccessEvent)}</div>`:""}
         </div>
         <div class="flex aic" style="gap:5px;flex-shrink:0">
-          ${staleBadge(node)}${maturityPill(node)}${typePill(node.type)}
+          ${roll?rollupBadges(roll):""}${staleBadge(node)}${S.advanced?typePill(node.type):""}
         </div>
       </div>`;
     if(hasKids && S.expanded[node.id]){
@@ -967,7 +1073,7 @@
   function viewPortfolio(){
     const ns = S.nodes;
     const states = ["active","incubator","inbox","frozen","archived"];
-    const portfolios = ns.filter(n=>n.type==="portfolio"&&n.portfolioState===S.pfFilter&&!n.mergeIntoId);
+    const portfolios = ns.filter(n=>n.type==="portfolio"&&n.portfolioState===S.pfFilter&&!n.mergeIntoId).slice().sort(byBlocked(ns));
     const wip = wipCounts(ns);
     const activeCount = ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="active").length;
 
@@ -985,25 +1091,29 @@
 
     let body;
     if(portfolios.length===0){
-      body = `<div class="empty">No portfolios here 此狀態無組合</div>`;
+      body = `<div class="empty">此狀態無對象</div>`;
     } else {
-      body = portfolios.map(p=>`
+      body = portfolios.map(p=>{
+        const roll = statusRollup(ns,p.id);
+        return `
         <div class="up" style="margin-bottom:14px">
           <div class="flex aic gap8 mb8" style="padding:0 2px">
             <span style="font-size:14px;color:var(--moss)">◉</span>
             <span style="font-size:14px;font-weight:600;flex:1">${esc(p.title)}</span>
+            ${rollupBadges(roll)}
             ${pill({c:"var(--inkMid)",bg:"var(--bgMuted)",i:"◷"}, lblEn(p.projectMode))}
           </div>
           <div class="node-row tap" style="border-left:3px solid var(--moss)" data-act="open" data-id="${p.id}">
             <div class="grow"><div style="font-size:11px;color:var(--inkLight)">${esc(p.summary||"")}</div></div>
             ${maturityPill(p)}
           </div>
-          ${childrenOf(ns,p.id).map(proj=>nodeRowHtml(proj, ns, 1)).join("")}
-        </div>`).join("");
+          ${childrenOf(ns,p.id).slice().sort(byBlocked(ns)).map(proj=>nodeRowHtml(proj, ns, 1)).join("")}
+        </div>`;
+      }).join("");
     }
 
     return html`
-    ${topbar("Portfolio 組合", activeCount+" active")}
+    ${topbar("對象 Account", activeCount+" active")}
     <div class="wip">${wipHtml}</div>
     <div class="chips">${chipsHtml}</div>
     <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}</div>`;
@@ -1024,8 +1134,8 @@
     const curMaturity = node.portfolioState||node.workStatus||node.executionStage;
 
     const transforms = {
-      project:[{to:"branch",label:"Convert → Branch 轉為支線"}],
-      branch:[{to:"work",label:"Convert → Work 轉為工作項"}],
+      project:[{to:"branch",label:"轉為工項 → Branch"}],
+      branch:[{to:"work",label:"轉為待辦 → Work"}],
       work:[{to:"project",label:"Convert → Project 轉為專案"}],
       portfolio:[{to:"frozen",label:"Freeze 凍結",freeze:true}],
     }[node.type] || [];
@@ -1042,6 +1152,7 @@
           </div>
           <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
         </div>
+        ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
         ${(!isFactory&&!node.mergeIntoId)?`<button class="btn btn-ghost sm" data-act="toggle-transform">⤿ Merge</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
@@ -1070,7 +1181,7 @@
     if(S.detailTab==="info"){
       const maturityControl = (!isFactory || node.type==="work") ? html`
         <div class="mb14">
-          <span class="label">${node.type==="portfolio"?"Portfolio State 組合狀態":node.type==="work"?"Work Status 工作狀態":"Execution Stage 執行階段"}</span>
+          <span class="label">${node.type==="portfolio"?"對象狀態":node.type==="work"?"待辦狀態":"Execution Stage 執行階段"}</span>
           <div class="flex gap6 wrap">
             ${maturityOpts.map(s=>{
               const cfg = node.type==="portfolio"?PORTFOLIO_CFG[s]:node.type==="work"?WORK_CFG[s]:STAGE_CFG[s];
@@ -1554,6 +1665,7 @@
 
     // click delegation
     root.onclick = e => {
+      if(e.target.closest("a.wlink")){ return; } // let the link open in a new tab
       const t = e.target.closest("[data-act],[data-cap-pick]");
       if(!t) return;
       // segmented brief pickers
@@ -1584,6 +1696,9 @@
         case "w-more": wMore(t.getAttribute("data-id")); break;
         case "blk-save": wBlockSave(); break;
         case "blk-cancel": S.blockFor=null; render(); break;
+        case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
+        case "move-cancel": S.moveFor=null; render(); break;
+        case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
         case "sync-clear": syncClearSettings(); break;
         case "sync-push": syncPush("manual"); break;
@@ -1594,6 +1709,9 @@
         case "addlog": addLog(); break;
         case "cap-commit": capCommit(); break;
         case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
+        case "cap-pick": { cap.pick={ mode:t.getAttribute("data-mode"), parentId:t.getAttribute("data-pid")||null }; cap.title=""; render(); break; }
+        case "cap-addnext": { const v=(cap.title||"").trim(); if(v){ cap.nexts.push(v); cap.title=""; } render(); break; }
+        case "cap-rmnext": { const i=+t.getAttribute("data-idx"); cap.nexts.splice(i,1); render(); break; }
         case "pickimg": document.getElementById("capimg").click(); break;
         case "pickfile": document.getElementById("importfile").click(); break;
         case "import-mode": S.importMode=t.getAttribute("data-mode"); S.importReport=null; render(); break;
@@ -1653,6 +1771,18 @@
   function doPin(id){
     updateNode(id, n=>{ n.tags=togglePin(n); return n; });
     render();
+  }
+  function doMove(newParentId){
+    const node = byId(S.nodes, S.moveFor); if(!node) return;
+    const np = byId(S.nodes, newParentId); if(!np) return;
+    const now = todayStr();
+    S.nodes = S.nodes.map(n=> n.id===node.id ? Object.assign({},n,{
+      parentId:newParentId, parentType:np.type, lastUpdated:now,
+      logs:(n.logs||[]).concat({id:uid("log"),date:now,signal:"manual",content:`⇄ 搬移到「${np.title}」`})
+    }) : n);
+    S.moveFor=null;
+    render();
+    maybeSync("move");
   }
   // ✅ 完成 — mark done, advance progress, clear blocker tag, suggest downstream OR auto-advance
   function wDone(id){
@@ -1747,59 +1877,108 @@
     render();
   }
   function capCommitDisabled(){
-    return !cap.target
-      || (cap.target!=="suggest"&&cap.target!=="update"&&(!cap.parentId||!cap.title))
-      || (cap.target==="update"&&!cap.parentId)
-      || (cap.target==="suggest"&&!cap.title);
+    const p = cap.pick;
+    if(!p) return true;
+    if(p.mode==="update") return false;                       // just logs
+    if(p.mode==="account") return !cap.title.trim();
+    if(p.mode==="work") return !(cap.nexts.length>0 || cap.title.trim() || cap.q_next.trim());
+    // branch / project
+    return !cap.title.trim();
   }
   function refreshCapCommit(){
     const btn = document.querySelector('[data-act="cap-commit"]');
     if(btn) btn.disabled = capCommitDisabled();
   }
-  // assemble a readable summary from the Brief answers + raw text
   function capSummary(){
     const ballMap={me:"球在我",them:"球在對方",waiting:"等待中",shared:"共同"};
     const bits=[];
     if(cap.q_what) bits.push(cap.q_what);
     if(cap.q_ball) bits.push("【"+(ballMap[cap.q_ball]||cap.q_ball)+"】");
-    if(cap.q_next) bits.push("下一步："+cap.q_next);
-    if(cap.raw) bits.push(cap.raw);
-    return bits.join(" / ");
+    return bits.join(" ");
   }
   function capResetForm(){
-    cap.raw=""; cap.target=""; cap.parentId=""; cap.title=""; cap.so=false; cap.sd=false; cap.sr=false; cap.mode="explore"; cap.signal="screenshot";
-    cap.images=[]; cap.q_what=""; cap.q_kind=""; cap.q_ball=""; cap.q_next=""; cap.caseNo=""; cap.dday="";
+    cap.images=[]; cap.signal="screenshot";
+    cap.q_what=""; cap.q_kind=""; cap.q_ball=""; cap.q_next="";
+    cap.nexts=[]; cap.link=""; cap.dday=""; cap.title=""; cap.mode="explore"; cap.pick=null;
+  }
+  // append a dated history log to the owning Account (root portfolio)
+  function logToAccount(rootId, content, signal, att){
+    if(!rootId) return;
+    S.nodes = S.nodes.map(n=> n.id===rootId ? Object.assign({},n,{
+      logs:(n.logs||[]).concat({ id:uid("log"), date:todayStr(), signal:signal||"screenshot", content:content }),
+      attachments: att && att.length ? (n.attachments||[]).concat(att) : (n.attachments||[]),
+      lastUpdated:todayStr(), lastProgress:todayStr(), progressSignal:signal||"screenshot"
+    }) : n);
   }
   function capCommit(){
     const now = todayStr();
-    const ns = S.nodes;
+    const p = cap.pick; if(!p) return;
+    const att = cap.images.map(src=>({id:uid("att"),kind:"image",src,added:now}));
     const summary = capSummary();
-    const att = cap.images.map((src,i)=>({id:uid("att"),kind:"image",src,added:now}));
-    const briefLog = { id:uid("log"), date:now, signal:cap.signal,
-      content:"📥 "+(summary||"capture")+(cap.images.length?` (${cap.images.length}張截圖)`:"") };
+    const whatLog = (cap.q_what||"").trim();
 
-    if(cap.target==="update"){
-      S.nodes = ns.map(n=>n.id===cap.parentId?Object.assign({},n,{
-        logs:(n.logs||[]).concat(briefLog),
+    // resolve the owning account (root portfolio) for the chosen pick
+    function rootOf(id){ let cur=byId(S.nodes,id),g=0; while(cur&&cur.parentId&&g++<6) cur=byId(S.nodes,cur.parentId); return cur; }
+
+    if(p.mode==="update"){
+      const target = byId(S.nodes, p.parentId);
+      // log on the target itself
+      S.nodes = S.nodes.map(n=>n.id===p.parentId?Object.assign({},n,{
+        logs:(n.logs||[]).concat({id:uid("log"),date:now,signal:cap.signal,content:"📥 "+(summary||"進度")}),
         attachments:(n.attachments||[]).concat(att),
         lastUpdated:now, lastProgress:now, progressSignal:cap.signal
       }):n);
-    } else {
-      let node;
-      if(cap.target==="work")    node={id:uid("wk"),type:"work",parentType:"branch",parentId:cap.parentId,title:cap.title,summary,workStatus:"todo",owner:(cap.q_ball==="them"?"them":(cap.q_ball==="me"?"me":"")),firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
-      if(cap.target==="branch")  node={id:uid("br"),type:"branch",parentType:"project",parentId:cap.parentId,title:cap.title,summary,executionStage:"ready",channel:"",firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
-      if(cap.target==="project") node={id:uid("pr"),type:"project",parentType:"portfolio",parentId:cap.parentId,title:cap.title,summary,executionStage:"ready",stakeholders:[],firstSuccessEvent:cap.q_next||"",deadline:cap.dday||null};
-      if(cap.target==="suggest") node={id:uid("p"),type:"portfolio",parentType:null,parentId:null,title:cap.title,summary,portfolioState:"inbox",projectMode:cap.mode||"explore"};
-      // tags: case no + dday (schema unchanged; encoded as tags)
+      // also log "what happened" to the owning account (history)
+      const root = rootOf(p.parentId);
+      if(root && whatLog && (!target || target.id!==root.id)) logToAccount(root.id, "📌 "+whatLog, cap.signal, null);
+
+    } else if(p.mode==="account"){
+      const id=uid("p");
+      const node={ id, type:"portfolio", parentType:null, parentId:null, title:cap.title.trim(), summary,
+        portfolioState:"inbox", projectMode:cap.mode||"explore",
+        tags:[], lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
+        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 建立對象"+(whatLog?"："+whatLog:"")}],
+        attachments:att };
+      S.nodes = S.nodes.concat(node);
+
+    } else if(p.mode==="work"){
+      // multiple 待辦 under the chosen branch
+      const titles = cap.nexts.slice();
+      const lead = (cap.title||"").trim(); if(lead) titles.push(lead);
+      const q = (cap.q_next||"").trim(); if(!titles.length && q) titles.push(q);
       let tags=[];
-      if(cap.caseNo) tags.push(TAG_CASE+cap.caseNo);
-      if(cap.dday && cap.target!=="suggest") tags.push(TAG_DDAY+cap.dday);
-      node = Object.assign(node, { tags, lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
-        logs:[briefLog], attachments:att });
-      S.nodes = ns.concat(node);
+      if(cap.dday) tags.push(TAG_DDAY+cap.dday);
+      if(cap.link) tags.push(TAG_LINK+cap.link);
+      const owner = cap.q_ball==="them"?"them":(cap.q_ball==="me"?"me":"");
+      const made = titles.map((t,i)=>({
+        id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary,
+        workStatus:"todo", owner, firstSuccessEvent:"", deadline:cap.dday||null,
+        tags: tags.slice(),
+        lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
+        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 由擷取建立"}],
+        attachments: i===0?att:[] // attach images to first only
+      }));
+      S.nodes = S.nodes.concat(made);
+      const root = rootOf(p.parentId);
+      if(root && whatLog) logToAccount(root.id, "📌 "+whatLog, cap.signal, att.length?[]:null);
+
+    } else { // branch / project
+      const isProj = p.mode==="project";
+      let tags=[];
+      if(cap.dday) tags.push(TAG_DDAY+cap.dday);
+      if(cap.link) tags.push(TAG_LINK+cap.link);
+      const node = isProj
+        ? { id:uid("pr"), type:"project", parentType:"portfolio", parentId:p.parentId, title:cap.title.trim(), summary, executionStage:"ready", stakeholders:[], firstSuccessEvent:"", deadline:cap.dday||null }
+        : { id:uid("br"), type:"branch", parentType:"project", parentId:p.parentId, title:cap.title.trim(), summary, executionStage:"ready", channel:"", firstSuccessEvent:"", deadline:cap.dday||null };
+      Object.assign(node, { tags, lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
+        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 由擷取建立"}], attachments:att });
+      S.nodes = S.nodes.concat(node);
+      const root = rootOf(p.parentId);
+      if(root && whatLog) logToAccount(root.id, "📌 "+whatLog, cap.signal, []);
     }
+
     capResetForm();
-    S.view="daily"; // back to the work list — momentum
+    S.view="daily";
     render();
     maybeSync("capture");
   }
