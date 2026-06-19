@@ -436,9 +436,10 @@
     importReport:null,
     mdPreview:false,
     advanced:false,     // UX: hide architecture terms by default
-    blockFor:null,      // work id whose blocker note is being entered
-    blockText:"",
     moveFor:null,       // node id being re-parented (移動到…)
+    moreFor:null,       // branch id under which 做更多 adds a 待辦
+    moreTitle:"", moreDday:"",
+    noteDraft:"",       // draft text for adding a note on detail
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -456,8 +457,15 @@
   function getCaseNo(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_CASE)===0); return t?t.slice(TAG_CASE.length):""; }
   function getDday(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_DDAY)===0); return t?t.slice(TAG_DDAY.length):""; }
   function getLink(n){ const t=(n.tags||[]).find(x=>x.indexOf(TAG_LINK)===0); return t?t.slice(TAG_LINK.length):""; }
+  const TAG_NOTE = "備註:";
+  function getNotes(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_NOTE)===0).map(x=>x.slice(TAG_NOTE.length)); }
+  // linkify URLs inside a note string → clickable anchors (escaped elsewhere)
+  function linkifyNote(text){
+    const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    return esc(text).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener" class="wlink" style="color:var(--slate);text-decoration:underline">$1</a>');
+  }
   function isPinned(n){ return (n.tags||[]).indexOf(TAG_PIN)>-1; }
-  function visibleTags(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_CASE)!==0&&x.indexOf(TAG_DDAY)!==0&&x.indexOf(TAG_LINK)!==0&&x!==TAG_PIN); }
+  function visibleTags(n){ return (n.tags||[]).filter(x=>x.indexOf(TAG_CASE)!==0&&x.indexOf(TAG_DDAY)!==0&&x.indexOf(TAG_LINK)!==0&&x.indexOf("備註:")!==0&&x!==TAG_PIN&&x!=="⏸延後"); }
   function setTagKV(n, prefix, value){
     let tags=(n.tags||[]).filter(x=>x.indexOf(prefix)!==0);
     if(value) tags.push(prefix+value);
@@ -470,6 +478,19 @@
   }
   // effective deadline = explicit node.deadline OR DDAY tag
   function effDeadline(n){ return n.deadline || getDday(n) || null; }
+  // creation date proxy: earliest log date, else lastProgress, else today
+  function createdDate(n){
+    if(n.logs && n.logs.length){ const ds=n.logs.map(l=>l.date).filter(Boolean).sort(); if(ds.length) return ds[0]; }
+    return n.lastProgress || todayStr();
+  }
+  // sorting deadline: real D-DAY, else implicit (creation + 7 days), so no-deadline
+  // items still take a position in the priority order instead of sinking to the bottom.
+  function sortDeadline(n){
+    const real = effDeadline(n);
+    if(real) return new Date(real).getTime();
+    const c = new Date(createdDate(n)).getTime();
+    return c + 7*24*3600*1000;
+  }
   // a node is "in progress / 卡點" if it's not archived and not done/complete
   function inProgress(n){
     if(n.type==="portfolio") return n.portfolioState!=="archived";
@@ -632,7 +653,7 @@
       default:          screen = viewDaily();
     }
     const nav = S.view==="detail" ? "" : bottomNav();
-    const overlay = S.blockFor ? blockerModalHtml() : (S.moveFor ? moveModalHtml() : "");
+    const overlay = S.moreFor ? moreModalHtml() : (S.moveFor ? moveModalHtml() : "");
     root.innerHTML = `<div class="screen">${screen}</div>${nav}${overlay}`;
     bind();
   }
@@ -715,20 +736,26 @@
       </button>`).join("") + `</nav>`;
   }
 
-  /* ─── DAILY (所有進行中 + 卡點) ─────────────────────────────────────────── */
+  /* ─── DAILY (進行中待辦 + 有D-DAY的葉節點) ──────────────────────────────── */
   function viewDaily(){
     const ns = S.nodes;
     const codes = buildCodes(ns);
-    // all in-progress work items (not done, not archived-root)
-    const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId)
-      .filter(w=>{ const r=rootPortfolio(ns,w); return !r || r.portfolioState!=="archived"; });
+    const notArchived = n => { const r=rootPortfolio(ns,n); return !r || r.portfolioState!=="archived"; };
 
-    function dval(w){ const d=effDeadline(w); return d? new Date(d).getTime() : Infinity; }
-    const sorted = works.slice().sort((a,b)=>{
-      const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;
-      if(pa!==pb) return pa-pb;                         // pinned first
-      const da=dval(a), db=dval(b);
-      if(da!==db) return da-db;                         // by D-DAY (undated last)
+    // 1) in-progress leaf work
+    const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId && notArchived(n));
+    // 2) branch/project that have a D-DAY but NO child work (so Daily wouldn't otherwise show them)
+    const leafDated = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
+      && n.executionStage!=="complete"
+      && effDeadline(n)
+      && !childrenOf(ns,n.id).some(c=>c.type==="work"));
+    const items = works.concat(leafDated);
+
+    const sorted = items.slice().sort((a,b)=>{
+      const da=sortDeadline(a), db=sortDeadline(b);
+      if(da!==db) return da-db;                          // D-DAY (implicit for undated) first
+      const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;      // pin only breaks ties
+      if(pa!==pb) return pa-pb;
       return daysSince(b.lastProgress)-daysSince(a.lastProgress);
     });
 
@@ -736,19 +763,16 @@
       <button class="btn btn-ghost sm" data-act="toggle-advanced" title="切換進階">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>
       <button class="btn btn-ghost sm" data-act="logout">切換 →</button>`;
 
-    // group by big-thing (root portfolio); ORDER groups by their most-urgent (earliest D-DAY)
-    // item so a newly-added urgent 待辦 floats its account to the top, regardless of entry order.
+    // group by account; order groups by their most-urgent member
     const groups = {};
     sorted.forEach(w=>{ const r=rootPortfolio(ns,w); const k=r?r.id:"_"; (groups[k]=groups[k]||[]).push(w); });
     const groupKeys = Object.keys(groups).sort((ka,kb)=>{
       const a=groups[ka], b=groups[kb];
-      // pinned item anywhere in group lifts it
-      const pa = a.some(isPinned)?0:1, pb = b.some(isPinned)?0:1;
-      if(pa!==pb) return pa-pb;
-      const ma = Math.min.apply(null, a.map(dval));  // earliest D-DAY in group
-      const mb = Math.min.apply(null, b.map(dval));
+      const ma = Math.min.apply(null, a.map(sortDeadline));
+      const mb = Math.min.apply(null, b.map(sortDeadline));
       if(ma!==mb) return ma-mb;
-      return 0;
+      const pa=a.some(isPinned)?0:1, pb=b.some(isPinned)?0:1;
+      return pa-pb;
     });
 
     let body = "";
@@ -763,7 +787,7 @@
                ${S.advanced?`<span class="tag">${lbl("portfolio")}</span>`:""}
              </div>`
           : "";
-        body += head + groups[gid].map(w=>workCardHtml(w, codes)).join("");
+        body += head + groups[gid].map(w=>workCardHtml(w, codes, ns)).join("");
       });
     }
 
@@ -772,64 +796,86 @@
     ${syncBar()}
     <div class="pad">
       <div class="muted" style="font-size:11px;margin-bottom:8px">
-        所有未完成的工作都在這裡，依交期排序（已釘選優先）。All in-progress work, sorted by D-DAY.
+        所有未完成的待辦都在這裡，依交期排序（無交期者以建立日+7天估算；釘選同級才優先）。
       </div>
       <div class="flex gap6 wrap mb14" style="font-size:10px;color:var(--inkLight)">
-        <span>✅ 完成</span><span>⏸ 延後</span><span>🚧 卡住</span><span>➕ 做更多</span>
+        <span>✅ 完成</span><span>⏸ 延後</span><span>➕ 做更多</span>
       </div>
       ${body}
     </div>`;
   }
 
-  // a single work card with case/code/D-DAY + four symbol buttons
-  function workCardHtml(w, codes){
+  // parent-context line: Account › Project › 工項
+  function parentContext(n, ns, codes){
+    const chain=[]; let cur=n.parentId?byId(ns,n.parentId):null, g=0;
+    while(cur && g++<5){ chain.unshift(cur); cur=cur.parentId?byId(ns,cur.parentId):null; }
+    if(!chain.length) return "";
+    return chain.map(c=>esc(c.title)).join(" › ");
+  }
+
+  // a single Daily card: work OR dated leaf branch/project. 3 buttons.
+  function workCardHtml(w, codes, ns){
+    ns = ns || S.nodes;
+    const isWork = w.type==="work";
     const dd = effDeadline(w);
+    const noDd = !dd;
+    const implied = noDd ? new Date(sortDeadline(w)) : null;
     const overdue = dd && new Date(dd) < Date.now();
     const stale = isStale(w);
     const pinned = isPinned(w);
     const code = codes[w.id] || "";
-    const blockTag = (w.tags||[]).find(x=>x.indexOf("🚧")===0); // blocker note stored as tag
+    const ctx = parentContext(w, ns, codes);
+    const typeTag = !isWork ? `<span class="tag" style="background:var(--bambooBg);color:var(--bamboo)">${w.type==="branch"?"工項":"專案"}・待拆待辦</span>` : "";
     return html`
     <div class="card" style="padding:13px 14px;margin-bottom:8px;${pinned?'border-left:3px solid var(--bamboo)':''}">
       <div class="flex between aic" style="gap:8px">
         <div class="grow tap" data-act="open" data-id="${w.id}">
+          ${ctx?`<div style="font-size:9px;color:var(--inkLight);margin-bottom:3px">${ctx}</div>`:""}
           <div class="flex aic gap6" style="margin-bottom:2px">
             ${code?`<span style="font-size:10px;color:var(--inkLight);font-weight:700">${code}</span>`:""}
             <span style="font-size:14px;font-weight:600">${esc(w.title)}</span>
+            ${typeTag}
           </div>
           <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
             ${w.owner?`<span>負責 ${esc(w.owner)}</span>`:""}
-            ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`:`<span>交期未定</span>`}
+            ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`
+                :`<span title="無交期，以建立日+7天估算">交期未定（約 ${fmt(implied.toISOString().slice(0,10))}）</span>`}
             ${stale?`<span class="badge-stale">⏱ ${daysSince(w.lastProgress)}d</span>`:""}
             ${getLink(w)?`<a class="wlink" href="${esc(getLink(w))}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
           </div>
-          ${blockTag?`<div style="margin-top:6px;font-size:11px;color:var(--clay);background:var(--clayBg);border-radius:var(--rsm);padding:5px 8px">🚧 ${esc(blockTag.slice(2).replace(/^:/,''))}</div>`:""}
         </div>
         <button class="btn btn-ghost sm" data-act="pin" data-id="${w.id}" title="釘選" style="padding:4px 8px">${pinned?"📌":"📍"}</button>
       </div>
       <div class="flex gap6 mt10">
         <button class="btn sm" style="flex:1;background:var(--mossBg);color:var(--moss)" data-act="w-done" data-id="${w.id}">✅ 完成</button>
         <button class="btn sm" style="flex:1;background:var(--bgMuted);color:var(--inkMid)" data-act="w-delay" data-id="${w.id}">⏸ 延後</button>
-        <button class="btn sm" style="flex:1;background:var(--clayBg);color:var(--clay)" data-act="w-block" data-id="${w.id}">🚧 卡住</button>
         <button class="btn sm" style="flex:1;background:var(--bambooBg);color:var(--bamboo)" data-act="w-more" data-id="${w.id}">➕ 做更多</button>
       </div>
     </div>`;
   }
 
-  function blockerModalHtml(){
-    const w = byId(S.nodes, S.blockFor);
+  function moreModalHtml(){
+    const ns=S.nodes;
+    const branch = byId(ns, S.moreFor);
+    const codes = buildCodes(ns);
+    const ctx = branch ? parentContext(branch, ns, codes) : "";
     return html`
     <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
       <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd)">
         <div class="flex between aic mb10">
-          <div style="font-family:'Lora',serif;font-size:16px">🚧 卡在哪？</div>
-          <button class="back" data-act="blk-cancel">×</button>
+          <div style="font-family:'Lora',serif;font-size:16px">➕ 新增待辦</div>
+          <button class="back" data-act="more-cancel">×</button>
         </div>
-        <div style="font-size:11px;color:var(--inkLight);margin-bottom:10px">${esc(w?w.title:"")}</div>
-        <textarea data-blk="text" rows="2" placeholder="一句話：卡在哪 / 等誰 / 等什麼…" style="margin-bottom:10px">${esc(S.blockText||"")}</textarea>
-        <div class="flex gap8">
-          <button class="btn btn-ghost" style="flex:1" data-act="blk-cancel">取消</button>
-          <button class="btn btn-clay" style="flex:2" data-act="blk-save">標記卡住 🚧</button>
+        <div style="font-size:11px;color:var(--inkLight);margin-bottom:12px">
+          ${ctx?ctx+" › ":""}<b>${esc(branch?branch.title:"")}</b> 底下
+        </div>
+        <div class="field"><span class="label">待辦 Work</span>
+          <input type="text" data-more="title" value="${esc(S.moreTitle||"")}" placeholder="要做什麼" autofocus></div>
+        <div class="field"><span class="label">交期 D-DAY（可留空）</span>
+          <input type="date" data-more="dday" value="${esc(S.moreDday||"")}"></div>
+        <div class="flex gap8 mt10">
+          <button class="btn btn-ghost" style="flex:1" data-act="more-cancel">取消</button>
+          <button class="btn btn-primary" style="flex:2" data-act="more-save">新增</button>
         </div>
       </div>
     </div>`;
@@ -1012,14 +1058,27 @@
 
   /* ─── PORTFOLIO ────────────────────────────────────────────────────────── */
   // roll up descendant 待辦(work) status: done ✅ / blocked 🚧 / pending ⏳
+  // a 工項(branch) is AUTO-blocked if no child work moved in >7 days, OR any child work is deferred(⏸延後)
+  function branchAutoBlocked(ns, branch){
+    const works = childrenOf(ns,branch.id).filter(c=>c.type==="work");
+    if(!works.length) return false;
+    const anyDeferred = works.some(w=>(w.tags||[]).indexOf("⏸延後")>-1 && w.workStatus!=="done");
+    if(anyDeferred) return true;
+    const openWorks = works.filter(w=>w.workStatus!=="done");
+    if(!openWorks.length) return false;
+    // movement = max lastProgress among open works; blocked if all idle >7d
+    const freshest = Math.min.apply(null, openWorks.map(w=>daysSince(w.lastProgress)));
+    return freshest > 7;
+  }
   function statusRollup(ns, nodeId){
     let done=0, blocked=0, pending=0;
     function walk(id){
       childrenOf(ns,id).forEach(c=>{
         if(c.type==="work"){
           if(c.workStatus==="done") done++;
-          else if((c.tags||[]).some(t=>t.indexOf("🚧")===0)) blocked++;
           else pending++;
+        } else if(c.type==="branch"){
+          if(branchAutoBlocked(ns,c)) blocked++;   // count auto-blocked 工項
         }
         walk(c.id);
       });
@@ -1039,7 +1098,11 @@
   function byBlocked(ns){
     return (a,b)=>{
       const ra=statusRollup(ns,a.id), rb=statusRollup(ns,b.id);
-      if(rb.blocked!==ra.blocked) return rb.blocked-ra.blocked;
+      // a branch that is itself auto-blocked counts as blocked for ordering
+      const ba=(a.type==="branch"&&branchAutoBlocked(ns,a))?1:0;
+      const bb=(b.type==="branch"&&branchAutoBlocked(ns,b))?1:0;
+      const tba=rb.blocked+bb-(ra.blocked+ba);
+      if(tba!==0) return tba;
       if(rb.pending!==ra.pending) return rb.pending-ra.pending;
       return 0;
     };
@@ -1052,8 +1115,8 @@
     const toggle = hasKids
       ? `<button class="tree-toggle" data-act="toggle" data-id="${node.id}">${S.expanded[node.id]?"▾":"▸"}</button>`
       : `<span style="width:14px;flex-shrink:0"></span>`;
-    // a work that is itself blocked shows 🚧
-    const selfBlocked = node.type==="work" && (node.tags||[]).some(t=>t.indexOf("🚧")===0);
+    // a 工項(branch) that is auto-blocked shows 🚧
+    const selfBlocked = node.type==="branch" && branchAutoBlocked(ns,node);
     let out = html`
       <div class="node-row" style="margin-left:${indent}px;border-left:3px solid ${TYPE_CFG[node.type].c}" data-act="open" data-id="${node.id}">
         ${toggle}
@@ -1201,11 +1264,32 @@
 
       const stake = (node.stakeholders&&node.stakeholders.length)
         ? `<div class="divider"></div><span class="label">Stakeholders 利害關係人</span>${node.stakeholders.map(s=>`<div style="font-size:12px;color:var(--inkMid);padding:3px 0">${esc(s.name)} · ${esc(s.role)} · ${esc(s.channel)}</div>`).join("")}` : "";
-      const tags = (node.tags&&node.tags.length)
-        ? `<div class="flex gap6 wrap mt14">${node.tags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>` : "";
+      const vtags = visibleTags(node);
+      const tags = vtags.length
+        ? `<div class="flex gap6 wrap mt14">${vtags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>` : "";
+
+      // notes (≤5, clickable URLs) — stored as 備註: tags
+      const notes = getNotes(node);
+      const notesBlock = html`
+      <div class="card" style="padding:12px 14px;margin-bottom:14px;background:var(--bambooBg);border-color:rgba(184,168,120,.35)">
+        <div class="flex between aic mb8">
+          <span class="label" style="margin:0">📌 備註・重點・連結（${notes.length}/5）</span>
+        </div>
+        ${notes.length? notes.map((nt,i)=>`
+          <div class="flex aic gap6" style="margin-bottom:6px">
+            <div style="flex:1;font-size:12px;color:var(--inkMid);line-height:1.5">${linkifyNote(nt)}</div>
+            <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="note-del" data-idx="${i}">×</button>
+          </div>`).join("") : `<div class="muted" style="font-size:11px;margin-bottom:6px">還沒有備註。可貼網址，會自動變可點連結。</div>`}
+        ${notes.length<5?`
+          <div class="flex gap6 mt6">
+            <input type="text" data-note="draft" value="${esc(S.noteDraft||"")}" placeholder="輸入重點或貼上 https://… " style="flex:1">
+            <button class="btn btn-secondary" data-act="note-add">＋ 加</button>
+          </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
+      </div>`;
 
       tabBody = html`
       <div class="up">
+        ${notesBlock}
         <p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary||"—")}</p>
         ${maturityControl}
         <div class="divider"></div>
@@ -1692,11 +1776,12 @@
         case "pin": doPin(t.getAttribute("data-id")); break;
         case "w-done": wDone(t.getAttribute("data-id")); break;
         case "w-delay": wDelay(t.getAttribute("data-id")); break;
-        case "w-block": wBlockStart(t.getAttribute("data-id")); break;
         case "w-more": wMore(t.getAttribute("data-id")); break;
-        case "blk-save": wBlockSave(); break;
-        case "blk-cancel": S.blockFor=null; render(); break;
+        case "more-save": wMoreSave(); break;
+        case "more-cancel": S.moreFor=null; render(); break;
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
+        case "note-add": noteAdd(); break;
+        case "note-del": noteDel(+t.getAttribute("data-idx")); break;
         case "move-cancel": S.moveFor=null; render(); break;
         case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
@@ -1736,7 +1821,8 @@
         return;
       }
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; return; }
-      if(el.hasAttribute("data-blk")){ S.blockText = el.value; return; }
+      if(el.hasAttribute("data-more")){ const k=el.getAttribute("data-more"); if(k==="title")S.moreTitle=el.value; if(k==="dday")S.moreDday=el.value; return; }
+      if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
@@ -1772,6 +1858,21 @@
     updateNode(id, n=>{ n.tags=togglePin(n); return n; });
     render();
   }
+  function noteAdd(){
+    const node = byId(S.nodes, S.selectedId); if(!node) return;
+    const txt=(S.noteDraft||"").trim(); if(!txt) return;
+    if(getNotes(node).length>=5) return;
+    updateNode(node.id, n=>{ n.tags=(n.tags||[]).concat("備註:"+txt); return n; });
+    S.noteDraft="";
+    render(); maybeSync("note");
+  }
+  function noteDel(idx){
+    const node = byId(S.nodes, S.selectedId); if(!node) return;
+    const notes=getNotes(node); if(idx<0||idx>=notes.length) return;
+    const target="備註:"+notes[idx];
+    updateNode(node.id, n=>{ let removed=false; n.tags=(n.tags||[]).filter(x=>{ if(!removed&&x===target){removed=true;return false;} return true; }); return n; });
+    render(); maybeSync("note");
+  }
   function doMove(newParentId){
     const node = byId(S.nodes, S.moveFor); if(!node) return;
     const np = byId(S.nodes, newParentId); if(!np) return;
@@ -1787,51 +1888,67 @@
   // ✅ 完成 — mark done, advance progress, clear blocker tag, suggest downstream OR auto-advance
   function wDone(id){
     updateNode(id, n=>{
-      n.workStatus="done"; n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
-      n.tags=(n.tags||[]).filter(x=>x.indexOf("🚧")!==0); // clear blocker
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"✅ 完成 done"});
+      if(n.type==="work"){ n.workStatus="done"; }
+      else { n.executionStage="complete"; }
+      n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
+      n.tags=(n.tags||[]).filter(x=>x!=="⏸延後"); // clear deferred flag
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"✅ 完成"});
       return n;
     });
-    render(); // momentum: list re-sorts, next item surfaces automatically (no "stop today?" prompt)
+    render(); // list re-sorts; the next nearest-D-DAY item surfaces automatically
     maybeSync("done");
   }
-  // ⏸ 延後 — pause: mark with a soft tag so it isn't treated as overdue; stays in progress
+  // ⏸ 延後 — push D-DAY by 7 days (works for dated and undated). Edit exact date in Portfolio.
   function wDelay(id){
     updateNode(id, n=>{
+      const base = effDeadline(n) ? new Date(effDeadline(n)) : new Date(createdDate(n)+ "T00:00:00");
+      const d = new Date(base.getTime() + 7*24*3600*1000);
+      const iso = d.toISOString().slice(0,10);
+      // store on node.deadline if it had one, else as DDAY tag
+      if(n.deadline) n.deadline = iso;
+      n.tags = setTagKVlocal(n.tags, TAG_DDAY, iso);
+      // mark deferred (drives auto-blocked on the parent 工項)
+      if((n.tags||[]).indexOf("⏸延後")<0) n.tags.push("⏸延後");
       n.lastUpdated=todayStr();
-      const tags=(n.tags||[]).filter(x=>x!=="⏸延後");
-      tags.push("⏸延後");
-      n.tags=tags;
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"⏸ 延後 deferred"});
+      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"⏸ 延後 +7 → "+iso});
       return n;
     });
     render();
+    maybeSync("delay");
   }
-  // ➕ 做更多 — bump as worked-on today (advance progress) and pin to keep visible
+  function setTagKVlocal(tags, prefix, value){
+    tags=(tags||[]).filter(x=>x.indexOf(prefix)!==0);
+    if(value) tags.push(prefix+value);
+    return tags;
+  }
+  // ➕ 做更多 — open simple popup to add ONE new 待辦 under the SAME 工項 (parent branch)
   function wMore(id){
-    updateNode(id, n=>{
-      n.workStatus="doing"; n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
-      if((n.tags||[]).indexOf(TAG_PIN)<0) n.tags=(n.tags||[]).concat(TAG_PIN);
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"➕ 做更多 more"});
-      return n;
-    });
+    const node = byId(S.nodes, id);
+    // target 工項 = the branch this work belongs to; if the card itself is a branch, use it
+    let branchId = null;
+    if(node){
+      if(node.type==="work") branchId = node.parentId;
+      else if(node.type==="branch") branchId = node.id;
+      else branchId = node.parentId;
+    }
+    S.moreFor = branchId;
+    S.moreTitle = ""; S.moreDday = "";
     render();
   }
-  // 🚧 卡住 — open a tiny blocker note inline
-  function wBlockStart(id){ S.blockFor=id; S.blockText=""; render(); }
-  function wBlockSave(){
-    const id=S.blockFor; if(!id) return;
-    const text=(S.blockText||"").trim();
-    updateNode(id, n=>{
-      n.lastUpdated=todayStr();
-      const tags=(n.tags||[]).filter(x=>x.indexOf("🚧")!==0);
-      tags.push("🚧:"+ (text||"卡住"));
-      n.tags=tags;
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"🚧 卡住："+(text||"(未填)")});
-      return n;
+  function wMoreSave(){
+    const branchId = S.moreFor; if(!branchId) return;
+    const title=(S.moreTitle||"").trim(); if(!title){ S.moreFor=null; render(); return; }
+    const now=todayStr();
+    const tags = S.moreDday ? [TAG_DDAY+S.moreDday] : [];
+    S.nodes = S.nodes.concat({
+      id:uid("wk"), type:"work", parentType:"branch", parentId:branchId, title,
+      summary:"", workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:S.moreDday||null,
+      tags, lastProgress:now, progressSignal:"manual", lastUpdated:now,
+      logs:[{id:uid("log"),date:now,signal:"manual",content:"➕ 做更多新增"}], attachments:[]
     });
-    S.blockFor=null; S.blockText="";
+    S.moreFor=null; S.moreTitle=""; S.moreDday="";
     render();
+    maybeSync("more");
   }
   function setMaturity(val){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
