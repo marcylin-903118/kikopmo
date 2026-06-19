@@ -440,6 +440,7 @@
     moreFor:null,       // branch id under which 做更多 adds a 待辦
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
+    chkDraft:"",        // draft text for adding a checklist subtask
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -505,6 +506,56 @@
     try { const u=localStorage.getItem(LS_SYNC_URL); if(u) S.syncUrl=u; } catch(e){}
     try { const d=localStorage.getItem(LS_DEVICE); if(d) S.syncDevice=d; } catch(e){}
     try { const m=localStorage.getItem(LS_SYNC_META); if(m) S.syncMeta=JSON.parse(m); } catch(e){}
+    if(S.nodes) S.nodes = S.nodes.map(migrateNode);
+  }
+  // ── migration: upgrade logs to structured objects; lazily ready metadata/checklist ──
+  // Never regenerate IDs. Never break imports. Backward compatible.
+  function migrateNode(n){
+    const m = Object.assign({}, n);
+    // logs: string → {id,date,type,message}; preserve {date,signal,content} too
+    m.logs = (Array.isArray(m.logs)?m.logs:[]).map(l=>{
+      if(typeof l==="string") return { id:uid("log"), date:todayStr(), type:"note", message:l };
+      if(l && (l.message!=null) && (l.type!=null)) return l; // already new
+      // old {id,date,signal,content}
+      return { id:l.id||uid("log"), date:l.date||todayStr(), type:l.type||"note", message:l.content!=null?l.content:(l.message||"") };
+    });
+    // metadata: create lazily but normalize priority; pull owner from legacy node.owner
+    if(!m.metadata || typeof m.metadata!=="object") m.metadata = {};
+    if(!m.metadata.priority) m.metadata.priority = "normal";
+    if(m.metadata.owner==null && m.owner) m.metadata.owner = m.owner;
+    // checklist only for work
+    if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
+    return m;
+  }
+  // structured log helpers
+  function mkLog(type, message){ return { id:uid("log"), date:todayStr(), type:type||"note", message:message||"" }; }
+  const LOG_TYPE_CFG = {
+    progress:{i:"▸",c:"var(--moss)",label:"進度"},
+    decision:{i:"◆",c:"var(--slate)",label:"決策"},
+    blocker:{i:"🚧",c:"var(--clay)",label:"卡點"},
+    note:{i:"✎",c:"var(--inkMid)",label:"備註"},
+    milestone:{i:"★",c:"var(--bamboo)",label:"里程碑"},
+  };
+  // metadata helpers
+  function getPriority(n){ return (n.metadata&&n.metadata.priority)||"normal"; }
+  function getOwner(n){ return (n.metadata&&n.metadata.owner)||n.owner||""; }
+  const PRIORITY_CFG = {
+    critical:{i:"🔴",c:"var(--clay)",label:"緊急",rank:0},
+    normal:{i:"⚪",c:"var(--inkMid)",label:"一般",rank:1},
+    low:{i:"⚫",c:"var(--inkLight)",label:"次要",rank:2},
+  };
+  function priorityRank(n){ const p=getPriority(n); return (PRIORITY_CFG[p]||PRIORITY_CFG.normal).rank; }
+  function setPriority(id, p){
+    updateNode(id, n=>{ n.metadata=Object.assign({},n.metadata,{priority:p}); n.lastUpdated=todayStr(); return n; });
+    render(); maybeSync("priority");
+  }
+  function cyclePriority(id){
+    const n=byId(S.nodes,id); const order=["normal","critical","low"];
+    const cur=getPriority(n); const next=order[(order.indexOf(cur)+1)%order.length];
+    setPriority(id, next);
+  }
+  function checklistStats(n){
+    const cl=n.checklist||[]; return { done:cl.filter(c=>c.done).length, total:cl.length };
   }
   let _lastNodesJson = "";
   function persist(){
@@ -752,10 +803,10 @@
     const items = works.concat(leafDated);
 
     const sorted = items.slice().sort((a,b)=>{
+      const ra=priorityRank(a), rb=priorityRank(b);
+      if(ra!==rb) return ra-rb;                          // critical → normal → low
       const da=sortDeadline(a), db=sortDeadline(b);
-      if(da!==db) return da-db;                          // D-DAY (implicit for undated) first
-      const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;      // pin only breaks ties
-      if(pa!==pb) return pa-pb;
+      if(da!==db) return da-db;                          // then D-DAY (implicit +7 for undated)
       return daysSince(b.lastProgress)-daysSince(a.lastProgress);
     });
 
@@ -768,11 +819,11 @@
     sorted.forEach(w=>{ const r=rootPortfolio(ns,w); const k=r?r.id:"_"; (groups[k]=groups[k]||[]).push(w); });
     const groupKeys = Object.keys(groups).sort((ka,kb)=>{
       const a=groups[ka], b=groups[kb];
+      const ra=Math.min.apply(null,a.map(priorityRank)), rb=Math.min.apply(null,b.map(priorityRank));
+      if(ra!==rb) return ra-rb;
       const ma = Math.min.apply(null, a.map(sortDeadline));
       const mb = Math.min.apply(null, b.map(sortDeadline));
-      if(ma!==mb) return ma-mb;
-      const pa=a.some(isPinned)?0:1, pb=b.some(isPinned)?0:1;
-      return pa-pb;
+      return ma-mb;
     });
 
     let body = "";
@@ -813,7 +864,7 @@
     return chain.map(c=>esc(c.title)).join(" › ");
   }
 
-  // a single Daily card: work OR dated leaf branch/project. 3 buttons.
+  // a single Daily card: work OR dated leaf branch/project. 3 buttons + priority toggle.
   function workCardHtml(w, codes, ns){
     ns = ns || S.nodes;
     const isWork = w.type==="work";
@@ -822,12 +873,15 @@
     const implied = noDd ? new Date(sortDeadline(w)) : null;
     const overdue = dd && new Date(dd) < Date.now();
     const stale = isStale(w);
-    const pinned = isPinned(w);
+    const pr = getPriority(w);
+    const prc = PRIORITY_CFG[pr]||PRIORITY_CFG.normal;
     const code = codes[w.id] || "";
     const ctx = parentContext(w, ns, codes);
     const typeTag = !isWork ? `<span class="tag" style="background:var(--bambooBg);color:var(--bamboo)">${w.type==="branch"?"工項":"專案"}・待拆待辦</span>` : "";
+    const cl = isWork ? checklistStats(w) : null;
+    const owner = getOwner(w);
     return html`
-    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pinned?'border-left:3px solid var(--bamboo)':''}">
+    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pr==='critical'?'border-left:3px solid var(--clay)':(pr==='low'?'border-left:3px solid var(--border)':'')}">
       <div class="flex between aic" style="gap:8px">
         <div class="grow tap" data-act="open" data-id="${w.id}">
           ${ctx?`<div style="font-size:9px;color:var(--inkLight);margin-bottom:3px">${ctx}</div>`:""}
@@ -837,14 +891,15 @@
             ${typeTag}
           </div>
           <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
-            ${w.owner?`<span>負責 ${esc(w.owner)}</span>`:""}
+            ${owner?`<span>負責 ${esc(owner)}</span>`:""}
             ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`
                 :`<span title="無交期，以建立日+7天估算">交期未定（約 ${fmt(implied.toISOString().slice(0,10))}）</span>`}
+            ${cl&&cl.total?`<span style="color:${cl.done===cl.total?'var(--moss)':'var(--inkLight)'}">☑ ${cl.done}/${cl.total}</span>`:""}
             ${stale?`<span class="badge-stale">⏱ ${daysSince(w.lastProgress)}d</span>`:""}
             ${getLink(w)?`<a class="wlink" href="${esc(getLink(w))}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
           </div>
         </div>
-        <button class="btn btn-ghost sm" data-act="pin" data-id="${w.id}" title="釘選" style="padding:4px 8px">${pinned?"📌":"📍"}</button>
+        <button class="btn btn-ghost sm" data-act="cycle-priority" data-id="${w.id}" title="優先級：${prc.label}" style="padding:4px 8px">${prc.i}</button>
       </div>
       <div class="flex gap6 mt10">
         <button class="btn sm" style="flex:1;background:var(--mossBg);color:var(--moss)" data-act="w-done" data-id="${w.id}">✅ 完成</button>
@@ -1287,8 +1342,48 @@
           </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
       </div>`;
 
+      // metadata row (Project/Branch/Work) — priority · deadline · owner · link
+      const showMeta = node.type!=="portfolio";
+      const prc = PRIORITY_CFG[getPriority(node)]||PRIORITY_CFG.normal;
+      const lk = getLink(node);
+      const metaRow = showMeta ? html`
+      <div class="card" style="padding:11px 13px;margin-bottom:12px">
+        <div class="flex aic gap8 wrap" style="font-size:11px">
+          <button class="btn btn-ghost sm" data-act="cycle-priority" data-id="${node.id}" style="padding:3px 9px">${prc.i} ${prc.label}</button>
+          ${effDeadline(node)?`<span style="color:var(--inkMid)">📅 ${fmt(effDeadline(node))}</span>`:`<span class="muted">無交期</span>`}
+          ${getOwner(node)?`<span style="color:var(--inkMid)">👤 ${esc(getOwner(node))}</span>`:""}
+          ${lk?`<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
+        </div>
+      </div>` : "";
+
+      // checklist (Work only)
+      let checklistBlock = "";
+      if(node.type==="work"){
+        const cl = node.checklist||[];
+        const st = checklistStats(node);
+        checklistBlock = html`
+        <div class="card" style="padding:12px 14px;margin-bottom:12px">
+          <div class="flex between aic mb8">
+            <span class="label" style="margin:0">☑ 子任務 Checklist ${st.total?`（${st.done}/${st.total}）`:""}</span>
+          </div>
+          ${cl.map((c,i)=>`
+            <div class="flex aic gap8" style="margin-bottom:5px">
+              <button class="btn btn-ghost" style="padding:2px 7px" data-act="chk-toggle" data-idx="${i}">${c.done?"☑":"☐"}</button>
+              <span style="flex:1;font-size:12px;${c.done?'color:var(--inkLight);text-decoration:line-through':'color:var(--inkMid)'}">${esc(c.text)}</span>
+              <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="chk-del" data-idx="${i}">×</button>
+            </div>`).join("")}
+          <div class="flex gap6 mt6">
+            <input type="text" data-chk="draft" value="${esc(S.chkDraft||"")}" placeholder="新增一個子任務" style="flex:1">
+            <button class="btn btn-secondary" data-act="chk-add">＋</button>
+          </div>
+          ${node.workStatus==="done"&&st.total&&st.done<st.total?`<div style="margin-top:8px;font-size:11px;color:var(--clay)">⚠ 此待辦已完成，但子任務尚未全部勾選</div>`:""}
+        </div>`;
+      }
+
       tabBody = html`
       <div class="up">
+        ${metaRow}
+        ${checklistBlock}
         ${notesBlock}
         <p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary||"—")}</p>
         ${maturityControl}
@@ -1300,23 +1395,31 @@
       </div>`;
     }
     else if(S.detailTab==="timeline"){
-      const logs = (node.logs||[]).slice().reverse().map(g=>`
+      const logs = (node.logs||[]).slice().reverse().map(g=>{
+        const cfg = LOG_TYPE_CFG[g.type]||LOG_TYPE_CFG.note;
+        const msg = g.message!=null?g.message:(g.content||"");
+        return `
         <div class="log">
-          <div class="dot">✎</div>
+          <div class="dot" style="color:${cfg.c}">${cfg.i}</div>
           <div class="body">
-            <div class="meta">${fmt(g.date)} · ${lblEn(g.signal||"manual")}</div>
-            <div class="content">${esc(g.content)}</div>
+            <div class="meta">${fmt(g.date)} · <span style="color:${cfg.c}">${cfg.label}</span></div>
+            <div class="content">${esc(msg)}</div>
           </div>
-        </div>`).join("");
+        </div>`;}).join("");
       tabBody = html`
       <div class="up">
         <div class="card" style="padding:13px;margin-bottom:14px">
-          <span class="label">Add log 新增記錄（advances progress）</span>
-          <div class="field"><select data-det="logSignal">${["manual","meeting","import","screenshot","chat"].map(k=>`<option value="${k}" ${det.logSignal===k?"selected":""}>${lbl(k)}</option>`).join("")}</select></div>
-          <textarea data-det="logText" rows="2" placeholder="What moved? 有什麼進展…">${esc(det.logText)}</textarea>
-          <div class="flex" style="justify-content:flex-end;margin-top:7px"><button class="btn btn-primary sm" data-act="addlog">Add 新增</button></div>
+          <span class="label">快速記一筆 Quick log</span>
+          <textarea data-det="logText" rows="2" placeholder="發生了什麼…">${esc(det.logText)}</textarea>
+          <div class="flex gap6 wrap" style="margin-top:8px">
+            <button class="btn sm" style="background:var(--mossBg);color:var(--moss)" data-act="addlog" data-type="progress">＋ 進度</button>
+            <button class="btn sm" style="background:var(--slateBg);color:var(--slate)" data-act="addlog" data-type="decision">＋ 決策</button>
+            <button class="btn sm" style="background:var(--clayBg);color:var(--clay)" data-act="addlog" data-type="blocker">＋ 卡點</button>
+            <button class="btn sm" style="background:var(--bgMuted);color:var(--inkMid)" data-act="addlog" data-type="note">＋ 備註</button>
+            <button class="btn sm" style="background:var(--bambooBg);color:var(--bamboo)" data-act="addlog" data-type="milestone">＋ 里程碑</button>
+          </div>
         </div>
-        ${logs || `<div class="empty">No log yet 尚無記錄</div>`}
+        ${logs || `<div class="empty">尚無記錄</div>`}
       </div>`;
     }
     else if(S.detailTab==="children"){
@@ -1761,7 +1864,7 @@
       switch(act){
         case "login": S.role=t.getAttribute("data-role"); S.view="daily"; render(); break;
         case "logout": S.role=null; S.selectedId=null; try{localStorage.removeItem(LS_ROLE);}catch(_){} render(); break;
-        case "seed-confirm": S.nodes=JSON.parse(JSON.stringify(SEED_NODES)); render(); break;
+        case "seed-confirm": S.nodes=JSON.parse(JSON.stringify(SEED_NODES)).map(migrateNode); render(); break;
         case "seed-skip": S.nodes=[]; render(); break;
         case "nav": { const v=t.getAttribute("data-view");
           if((v==="capture"||v==="import")&&S.role==="factory") return;
@@ -1774,6 +1877,7 @@
         case "workstatus": setWorkStatus(t.getAttribute("data-id"), t.getAttribute("data-status")); break;
         case "toggle-advanced": S.advanced=!S.advanced; render(); break;
         case "pin": doPin(t.getAttribute("data-id")); break;
+        case "cycle-priority": cyclePriority(t.getAttribute("data-id")); break;
         case "w-done": wDone(t.getAttribute("data-id")); break;
         case "w-delay": wDelay(t.getAttribute("data-id")); break;
         case "w-more": wMore(t.getAttribute("data-id")); break;
@@ -1782,6 +1886,9 @@
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
         case "note-add": noteAdd(); break;
         case "note-del": noteDel(+t.getAttribute("data-idx")); break;
+        case "chk-add": chkAdd(); break;
+        case "chk-toggle": chkToggle(+t.getAttribute("data-idx")); break;
+        case "chk-del": chkDel(+t.getAttribute("data-idx")); break;
         case "move-cancel": S.moveFor=null; render(); break;
         case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
@@ -1791,7 +1898,7 @@
         case "set-maturity": setMaturity(t.getAttribute("data-val")); break;
         case "toggle-transform": det.showTransform=!det.showTransform; render(); break;
         case "transform": doTransform(t.getAttribute("data-to"), t.getAttribute("data-freeze")==="1"); break;
-        case "addlog": addLog(); break;
+        case "addlog": addLog(t.getAttribute("data-type")); break;
         case "cap-commit": capCommit(); break;
         case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
         case "cap-pick": { cap.pick={ mode:t.getAttribute("data-mode"), parentId:t.getAttribute("data-pid")||null }; cap.title=""; render(); break; }
@@ -1823,6 +1930,7 @@
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; return; }
       if(el.hasAttribute("data-more")){ const k=el.getAttribute("data-more"); if(k==="title")S.moreTitle=el.value; if(k==="dday")S.moreDday=el.value; return; }
       if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
+      if(el.hasAttribute("data-chk")){ S.chkDraft=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
@@ -1873,13 +1981,29 @@
     updateNode(node.id, n=>{ let removed=false; n.tags=(n.tags||[]).filter(x=>{ if(!removed&&x===target){removed=true;return false;} return true; }); return n; });
     render(); maybeSync("note");
   }
+  function chkAdd(){
+    const node=byId(S.nodes,S.selectedId); if(!node||node.type!=="work") return;
+    const txt=(S.chkDraft||"").trim(); if(!txt) return;
+    updateNode(node.id, n=>{ n.checklist=(n.checklist||[]).concat({id:uid("chk"),text:txt,done:false}); return n; });
+    S.chkDraft=""; render(); maybeSync("checklist");
+  }
+  function chkToggle(idx){
+    const node=byId(S.nodes,S.selectedId); if(!node) return;
+    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); if(cl[idx]) cl[idx]=Object.assign({},cl[idx],{done:!cl[idx].done}); n.checklist=cl; return n; });
+    render(); maybeSync("checklist");
+  }
+  function chkDel(idx){
+    const node=byId(S.nodes,S.selectedId); if(!node) return;
+    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); cl.splice(idx,1); n.checklist=cl; return n; });
+    render(); maybeSync("checklist");
+  }
   function doMove(newParentId){
     const node = byId(S.nodes, S.moveFor); if(!node) return;
     const np = byId(S.nodes, newParentId); if(!np) return;
     const now = todayStr();
     S.nodes = S.nodes.map(n=> n.id===node.id ? Object.assign({},n,{
       parentId:newParentId, parentType:np.type, lastUpdated:now,
-      logs:(n.logs||[]).concat({id:uid("log"),date:now,signal:"manual",content:`⇄ 搬移到「${np.title}」`})
+      logs:(n.logs||[]).concat(mkLog("note",`⇄ 搬移到「${np.title}」`))
     }) : n);
     S.moveFor=null;
     render();
@@ -1892,7 +2016,7 @@
       else { n.executionStage="complete"; }
       n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
       n.tags=(n.tags||[]).filter(x=>x!=="⏸延後"); // clear deferred flag
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"✅ 完成"});
+      n.logs=(n.logs||[]).concat(mkLog("milestone","✅ 完成"));
       return n;
     });
     render(); // list re-sorts; the next nearest-D-DAY item surfaces automatically
@@ -1910,7 +2034,7 @@
       // mark deferred (drives auto-blocked on the parent 工項)
       if((n.tags||[]).indexOf("⏸延後")<0) n.tags.push("⏸延後");
       n.lastUpdated=todayStr();
-      n.logs=(n.logs||[]).concat({id:uid("log"),date:todayStr(),signal:"manual",content:"⏸ 延後 +7 → "+iso});
+      n.logs=(n.logs||[]).concat(mkLog("blocker","⏸ 延後 +7 → "+iso));
       return n;
     });
     render();
@@ -1944,7 +2068,7 @@
       id:uid("wk"), type:"work", parentType:"branch", parentId:branchId, title,
       summary:"", workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:S.moreDday||null,
       tags, lastProgress:now, progressSignal:"manual", lastUpdated:now,
-      logs:[{id:uid("log"),date:now,signal:"manual",content:"➕ 做更多新增"}], attachments:[]
+      logs:[mkLog("progress","➕ 做更多新增")], attachments:[]
     });
     S.moreFor=null; S.moreTitle=""; S.moreDday="";
     render();
@@ -1959,15 +2083,16 @@
     S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,upd):n);
     render();
   }
-  function addLog(){
+  function addLog(type){
     if(!det.logText.trim()) return;
     const node = byId(S.nodes, S.selectedId); if(!node) return;
-    const entry = { id:uid("log"), date:todayStr(), signal:det.logSignal, content:det.logText };
-    S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,{
-      logs:(n.logs||[]).concat(entry), lastUpdated:todayStr(), lastProgress:todayStr(), progressSignal:det.logSignal
-    }):n);
+    const entry = mkLog(type||"note", det.logText.trim());
+    const advance = (type==="progress"||type==="milestone");
+    S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,Object.assign({
+      logs:(n.logs||[]).concat(entry), lastUpdated:todayStr()
+    }, advance?{lastProgress:todayStr(),progressSignal:"manual"}:{})):n);
     det.logText = "";
-    render();
+    render(); maybeSync("log");
   }
   function doTransform(to, freeze){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
