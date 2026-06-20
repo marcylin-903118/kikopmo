@@ -441,6 +441,7 @@
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
     chkDraft:"",        // draft text for adding a checklist subtask
+    highlightId:null,   // work to highlight after Daily→Project deep link
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -777,9 +778,9 @@
   }
   function bottomNav(){
     const items = S.role==="factory"
-      ? [["daily","Daily 焦點","☀"],["portfolio","對象","◉"],["export","Export 匯出","⤓"],["settings","設定","⚙"]]
-      : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","對象","◉"],
-         ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"],["settings","設定","⚙"]];
+      ? [["daily","Daily 焦點","☀"],["portfolio","Account 對象","◉"],["export","Export 匯出","⤓"],["settings","Setup 設定","⚙"]]
+      : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","Account 對象","◉"],
+         ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"],["settings","Setup 設定","⚙"]];
     return `<nav class="bottomnav">` + items.map(([id,label,ic])=>`
       <button data-act="nav" data-view="${id}" class="${S.view===id?"on":""}">
         <span class="ic">${ic}</span><span class="tx">${label}</span>
@@ -803,10 +804,10 @@
     const items = works.concat(leafDated);
 
     const sorted = items.slice().sort((a,b)=>{
-      const ra=priorityRank(a), rb=priorityRank(b);
-      if(ra!==rb) return ra-rb;                          // critical → normal → low
-      const da=sortDeadline(a), db=sortDeadline(b);
-      if(da!==db) return da-db;                          // then D-DAY (implicit +7 for undated)
+      const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;     // pin first
+      if(pa!==pb) return pa-pb;
+      const da=sortDeadline(a), db=sortDeadline(b);      // then D-DAY (implicit +7 for undated)
+      if(da!==db) return da-db;
       return daysSince(b.lastProgress)-daysSince(a.lastProgress);
     });
 
@@ -819,8 +820,8 @@
     sorted.forEach(w=>{ const r=rootPortfolio(ns,w); const k=r?r.id:"_"; (groups[k]=groups[k]||[]).push(w); });
     const groupKeys = Object.keys(groups).sort((ka,kb)=>{
       const a=groups[ka], b=groups[kb];
-      const ra=Math.min.apply(null,a.map(priorityRank)), rb=Math.min.apply(null,b.map(priorityRank));
-      if(ra!==rb) return ra-rb;
+      const pa=a.some(isPinned)?0:1, pb=b.some(isPinned)?0:1;
+      if(pa!==pb) return pa-pb;
       const ma = Math.min.apply(null, a.map(sortDeadline));
       const mb = Math.min.apply(null, b.map(sortDeadline));
       return ma-mb;
@@ -863,8 +864,28 @@
     if(!chain.length) return "";
     return chain.map(c=>esc(c.title)).join(" › ");
   }
+  // Daily card context: 【Project】Branch (Account is the group heading, not here).
+  // Recognition, not navigation — no full arrow path.
+  function projectBranchContext(n, ns){
+    let project=null, branch=null, cur=n.parentId?byId(ns,n.parentId):null, g=0;
+    while(cur && g++<5){
+      if(cur.type==="branch") branch=cur;
+      if(cur.type==="project") project=cur;
+      cur=cur.parentId?byId(ns,cur.parentId):null;
+    }
+    const parts=[];
+    if(project) parts.push(`<span style="font-weight:600">【${esc(project.title)}】</span>`);
+    if(branch) parts.push(esc(branch.title));
+    return parts.join(" ");
+  }
+  // nearest ancestor project id (for Daily → Project deep link)
+  function ownerProjectId(n, ns){
+    let cur=n.parentId?byId(ns,n.parentId):null, g=0;
+    while(cur && g++<5){ if(cur.type==="project") return cur.id; cur=cur.parentId?byId(ns,cur.parentId):null; }
+    return n.type==="project"?n.id:null;
+  }
 
-  // a single Daily card: work OR dated leaf branch/project. 3 buttons + priority toggle.
+  // a single Daily card: work OR dated leaf branch/project. 3 buttons + pin.
   function workCardHtml(w, codes, ns){
     ns = ns || S.nodes;
     const isWork = w.type==="work";
@@ -873,33 +894,26 @@
     const implied = noDd ? new Date(sortDeadline(w)) : null;
     const overdue = dd && new Date(dd) < Date.now();
     const stale = isStale(w);
-    const pr = getPriority(w);
-    const prc = PRIORITY_CFG[pr]||PRIORITY_CFG.normal;
-    const code = codes[w.id] || "";
-    const ctx = parentContext(w, ns, codes);
+    const pinned = isPinned(w);
+    const ctx = projectBranchContext(w, ns);
     const typeTag = !isWork ? `<span class="tag" style="background:var(--bambooBg);color:var(--bamboo)">${w.type==="branch"?"工項":"專案"}・待拆待辦</span>` : "";
-    const cl = isWork ? checklistStats(w) : null;
-    const owner = getOwner(w);
+    const lk = getLink(w);
     return html`
-    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pr==='critical'?'border-left:3px solid var(--clay)':(pr==='low'?'border-left:3px solid var(--border)':'')}">
+    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pinned?'border-left:3px solid var(--bamboo)':''}">
       <div class="flex between aic" style="gap:8px">
-        <div class="grow tap" data-act="open" data-id="${w.id}">
-          ${ctx?`<div style="font-size:9px;color:var(--inkLight);margin-bottom:3px">${ctx}</div>`:""}
+        <div class="grow tap" data-act="open-from-daily" data-id="${w.id}">
+          ${ctx?`<div style="font-size:10px;color:var(--inkLight);margin-bottom:3px">${ctx}</div>`:""}
           <div class="flex aic gap6" style="margin-bottom:2px">
-            ${code?`<span style="font-size:10px;color:var(--inkLight);font-weight:700">${code}</span>`:""}
-            <span style="font-size:14px;font-weight:600">${esc(w.title)}</span>
+            <span style="font-size:15px;font-weight:700">${esc(w.title)}</span>
             ${typeTag}
           </div>
           <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
-            ${owner?`<span>負責 ${esc(owner)}</span>`:""}
             ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`
                 :`<span title="無交期，以建立日+7天估算">交期未定（約 ${fmt(implied.toISOString().slice(0,10))}）</span>`}
-            ${cl&&cl.total?`<span style="color:${cl.done===cl.total?'var(--moss)':'var(--inkLight)'}">☑ ${cl.done}/${cl.total}</span>`:""}
-            ${stale?`<span class="badge-stale">⏱ ${daysSince(w.lastProgress)}d</span>`:""}
-            ${getLink(w)?`<a class="wlink" href="${esc(getLink(w))}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
+            ${lk?`<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
           </div>
         </div>
-        <button class="btn btn-ghost sm" data-act="cycle-priority" data-id="${w.id}" title="優先級：${prc.label}" style="padding:4px 8px">${prc.i}</button>
+        <button class="btn btn-ghost sm" data-act="pin" data-id="${w.id}" title="釘選" style="padding:4px 8px">${pinned?"📌":"📍"}</button>
       </div>
       <div class="flex gap6 mt10">
         <button class="btn sm" style="flex:1;background:var(--mossBg);color:var(--moss)" data-act="w-done" data-id="${w.id}">✅ 完成</button>
@@ -1069,40 +1083,39 @@
     ${topbar("Capture 擷取", `${cap.images.length} 張截圖 · 一個 session`, right)}
     <div class="pad">
       <div class="note-muted" style="border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:11px;line-height:1.6">
-        一次可放多張截圖（同一段對話）。先回答幾個問題，再從下面的結構點一個位置放。
+        先選既有對象或開新對象，再從結構點位置放。可一次建多個專案/工項/待辦，最後一起確認。
       </div>
 
-      <span class="label">截圖 Screenshots（可多張）</span>
-      <div class="drop" data-act="pickimg" id="capdrop">
-        <div style="font-size:22px;margin-bottom:4px">📷</div>
-        <div style="font-size:12px;color:var(--inkMid)">點擊新增截圖 Tap to add（可重複）</div>
-        <input type="file" accept="image/*" multiple id="capimg" style="display:none">
+      <div class="sect">① 既有對象 / 新增對象</div>
+      <div class="card" style="padding:10px 12px">
+        <button class="btn ${pick&&pick.mode==='account'?'btn-moss':'btn-secondary'} full mb8" style="justify-content:flex-start" data-act="cap-pick" data-mode="account" data-pid="">➕ 開一個全新的對象（Account）</button>
+        <div class="muted" style="font-size:10px;margin:2px 2px 6px">或從既有結構點一個位置（每層可加子項）：</div>
+        <div style="max-height:240px;overflow:auto">${treeHtml}</div>
       </div>
-      ${imgThumbs}
+      ${pick?`<div class="note-muted" style="border-radius:var(--rsm);padding:8px 12px;margin-top:10px;font-size:11px;color:var(--moss)">已選：${esc(pickedLabel())}</div>`:""}
 
-      <div class="sect">Brief 快速理解</div>
-      <div class="field"><span class="label">① 發生什麼事？（會記成對象的歷程 log）</span>
-        <textarea data-cap="q_what" rows="2" placeholder="一兩句話描述">${esc(cap.q_what)}</textarea></div>
-      <div class="field"><span class="label">② 是既有的還是新的？</span>
-        <div class="seg">
-          ${[["existing","既有"],["new","新的"]].map(([v,t])=>`<button data-cap-pick="q_kind" data-val="${v}" class="${cap.q_kind===v?"on":""}" style="${cap.q_kind===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
-        </div>
-      </div>
-      <div class="field"><span class="label">③ 球在誰手上？</span>
+      <div class="sect">② 發生什麼事？（記成專案歷程 log，預設今天）</div>
+      <div class="field"><textarea data-cap="q_what" rows="2" placeholder="一兩句話描述">${esc(cap.q_what)}</textarea></div>
+
+      <div class="sect">③ 下一步</div>
+      <div class="field"><input type="text" data-cap="q_next" value="${esc(cap.q_next)}" placeholder="例：等工廠回報價"></div>
+
+      ${detailBlock}
+
+      <div class="sect" style="color:var(--inkLight)">球在誰手上？（dispatch 才會用到）</div>
+      <div class="field">
         <div class="seg">
           ${[["me","我"],["them","對方"],["waiting","等待"],["shared","共同"]].map(([v,t])=>`<button data-cap-pick="q_ball" data-val="${v}" class="${cap.q_ball===v?"on":""}" style="${cap.q_ball===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
         </div>
       </div>
-      <div class="field"><span class="label">④ 下一步是什麼？（建待辦時可當第一筆）</span>
-        <input type="text" data-cap="q_next" value="${esc(cap.q_next)}" placeholder="例：等工廠回報價"></div>
 
-      <div class="sect">要放到哪？（點結構裡的位置）</div>
-      <div class="card" style="padding:10px 12px">
-        <button class="btn ${pick&&pick.mode==='account'?'btn-moss':'btn-secondary'} full mb8" style="justify-content:flex-start" data-act="cap-pick" data-mode="account" data-pid="">➕ 開一個全新的對象（Account）</button>
-        <div style="max-height:260px;overflow:auto">${treeHtml}</div>
+      <div class="sect" style="color:var(--inkLight)">截圖（未串 AI，目前僅留存）</div>
+      <div class="drop" data-act="pickimg" id="capdrop">
+        <div style="font-size:18px;margin-bottom:4px">📷</div>
+        <div style="font-size:11px;color:var(--inkMid)">點擊新增截圖（可多張）</div>
+        <input type="file" accept="image/*" multiple id="capimg" style="display:none">
       </div>
-      ${pick?`<div class="note-muted" style="border-radius:var(--rsm);padding:8px 12px;margin-top:10px;font-size:11px;color:var(--moss)">已選：${esc(pickedLabel())}</div>`:""}
-      ${detailBlock}
+      ${imgThumbs}
 
       <button class="btn btn-primary full mt14" data-act="cap-commit" ${disabled?"disabled":""}>
         ${pick&&pick.mode==="account"?"建立對象（確認）":pick&&pick.mode==="update"?"記錄進度":"建立並歸位"}
@@ -1213,25 +1226,48 @@
     } else {
       body = portfolios.map(p=>{
         const roll = statusRollup(ns,p.id);
+        const projects = childrenOf(ns,p.id).filter(n=>n.type==="project").slice().sort(byBlocked(ns));
+        // each project = a card with bold name + bulleted branch/work outline (static preview)
+        const projectCards = projects.length ? projects.map(proj=>{
+          const branches = childrenOf(ns,proj.id).filter(n=>n.type==="branch");
+          const proll = statusRollup(ns,proj.id);
+          const dd = effDeadline(proj);
+          // outline: branches, each with its works as sub-bullets (shallow, non-interactive preview)
+          const outline = branches.map(br=>{
+            const works = childrenOf(ns,br.id).filter(n=>n.type==="work");
+            const blocked = branchAutoBlocked(ns,br);
+            const wbul = works.slice(0,5).map(w=>`<div style="font-size:10px;color:var(--inkLight);margin-left:14px">· ${w.workStatus==="done"?'<span style="color:var(--moss)">✓</span> ':""}${esc(w.title)}</div>`).join("");
+            return `<div style="margin-top:5px">
+              <div style="font-size:11px;color:var(--inkMid)">${blocked?"🚧 ":"▸ "}${esc(br.title)}</div>
+              ${wbul}${works.length>5?`<div style="font-size:10px;color:var(--inkLight);margin-left:14px">… 還有 ${works.length-5} 項</div>`:""}
+            </div>`;
+          }).join("") || `<div style="font-size:10px;color:var(--inkLight);margin-top:4px">尚無工項</div>`;
+          return `
+          <div class="card tap" data-act="open" data-id="${proj.id}" style="padding:13px 14px;margin-bottom:10px">
+            <div class="flex between aic" style="gap:8px">
+              <span style="font-size:14px;font-weight:700;flex:1">${esc(proj.title)}</span>
+              ${rollupBadges(proll)}
+            </div>
+            ${dd?`<div style="font-size:10px;color:var(--inkLight);margin-top:2px">📅 ${fmt(dd)}</div>`:""}
+            ${outline}
+          </div>`;
+        }).join("") : `<div class="muted" style="font-size:11px;padding:4px 2px 10px">此對象底下還沒有專案。</div>`;
+
         return `
-        <div class="up" style="margin-bottom:14px">
-          <div class="flex aic gap8 mb8" style="padding:0 2px">
-            <span style="font-size:14px;color:var(--moss)">◉</span>
-            <span style="font-size:14px;font-weight:600;flex:1">${esc(p.title)}</span>
+        <div class="up" style="margin-bottom:22px">
+          <div class="flex aic gap8 mb10" style="padding:0 2px">
+            <span style="font-size:15px;color:var(--moss)">◉</span>
+            <span class="tap" data-act="open" data-id="${p.id}" style="font-size:15px;font-weight:600;flex:1">${esc(p.title)}</span>
             ${rollupBadges(roll)}
             ${pill({c:"var(--inkMid)",bg:"var(--bgMuted)",i:"◷"}, lblEn(p.projectMode))}
           </div>
-          <div class="node-row tap" style="border-left:3px solid var(--moss)" data-act="open" data-id="${p.id}">
-            <div class="grow"><div style="font-size:11px;color:var(--inkLight)">${esc(p.summary||"")}</div></div>
-            ${maturityPill(p)}
-          </div>
-          ${childrenOf(ns,p.id).slice().sort(byBlocked(ns)).map(proj=>nodeRowHtml(proj, ns, 1)).join("")}
+          ${projectCards}
         </div>`;
       }).join("");
     }
 
     return html`
-    ${topbar("對象 Account", activeCount+" active")}
+    ${topbar("Account 對象", activeCount+" active")}
     <div class="wip">${wipHtml}</div>
     <div class="chips">${chipsHtml}</div>
     <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}</div>`;
@@ -1271,15 +1307,14 @@
           <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
-        ${(!isFactory&&!node.mergeIntoId)?`<button class="btn btn-ghost sm" data-act="toggle-transform">⤿ Merge</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
         ${maturityPill(node,true)}${staleBadge(node)}
         <span style="font-size:11px;color:var(--inkLight);margin-left:auto">progress ${fmt(node.lastProgress)} · ${lblEn(node.progressSignal||"manual")}</span>
       </div>
       <div class="tabs">
-        ${[["info","資訊"],["timeline","時間軸"],["children","下層"]].map(([id,t])=>`
-          <button data-act="tab" data-tab="${id}" class="${S.detailTab===id?"on":""}">${t}</button>`).join("")}
+        ${[["info","總覽"],["branch","工項"]].map(([id,t])=>`
+          <button data-act="tab" data-tab="${id}" class="${(S.detailTab===id||(id==="info"&&S.detailTab!=="branch"))?"on":""}">${t}</button>`).join("")}
       </div>
     </div>`;
 
@@ -1296,10 +1331,12 @@
 
     /* tab body */
     let tabBody = "";
-    if(S.detailTab==="info"){
+    const onBranchTab = S.detailTab==="branch";
+    if(!onBranchTab){
+      // ── 總覽 Overview: stakeholders/contacts · status · notes(facts) · checklist(work) · unified logs(history) ──
       const maturityControl = (!isFactory || node.type==="work") ? html`
         <div class="mb14">
-          <span class="label">${node.type==="portfolio"?"對象狀態":node.type==="work"?"待辦狀態":"Execution Stage 執行階段"}</span>
+          <span class="label">${node.type==="portfolio"?"對象狀態":node.type==="work"?"待辦狀態":"執行階段"}</span>
           <div class="flex gap6 wrap">
             ${maturityOpts.map(s=>{
               const cfg = node.type==="portfolio"?PORTFOLIO_CFG[s]:node.type==="work"?WORK_CFG[s]:STAGE_CFG[s];
@@ -1309,63 +1346,49 @@
           </div>
         </div>` : "";
 
-      const facts = [];
-      if(node.type==="portfolio") facts.push(["Mode 模式", lbl(node.projectMode)]);
-      if(node.type!=="portfolio") facts.push(["Deadline 期限", fmt(node.deadline)]);
-      if(node.firstSuccessEvent) facts.push(["First success 成功訊號", node.firstSuccessEvent]);
-      if(node.owner) facts.push(["Owner 負責", node.owner]);
-      if(node.channel) facts.push(["Channel 管道", node.channel]);
-      if(node.clientName) facts.push(["Client 客戶", node.clientName]);
+      // summary = current state (shown once, at top, not duplicated into notes/logs)
+      const summaryBlock = node.summary ? `<p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary)}</p>` : "";
 
+      // stakeholders / contacts (only this from old facts cluster)
       const stake = (node.stakeholders&&node.stakeholders.length)
-        ? `<div class="divider"></div><span class="label">Stakeholders 利害關係人</span>${node.stakeholders.map(s=>`<div style="font-size:12px;color:var(--inkMid);padding:3px 0">${esc(s.name)} · ${esc(s.role)} · ${esc(s.channel)}</div>`).join("")}` : "";
-      const vtags = visibleTags(node);
-      const tags = vtags.length
-        ? `<div class="flex gap6 wrap mt14">${vtags.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>` : "";
+        ? `<div class="card" style="padding:11px 13px;margin-bottom:12px"><span class="label">利害關係人 / 聯絡人</span>${node.stakeholders.map(s=>`<div style="font-size:12px;color:var(--inkMid);padding:3px 0">${esc(s.name)}${s.role?" · "+esc(s.role):""}${s.channel?" · "+esc(s.channel):""}</div>`).join("")}</div>` : "";
 
-      // notes (≤5, clickable URLs) — stored as 備註: tags
-      const notes = getNotes(node);
-      const notesBlock = html`
-      <div class="card" style="padding:12px 14px;margin-bottom:14px;background:var(--bambooBg);border-color:rgba(184,168,120,.35)">
-        <div class="flex between aic mb8">
-          <span class="label" style="margin:0">📌 備註・重點・連結（${notes.length}/5）</span>
-        </div>
-        ${notes.length? notes.map((nt,i)=>`
-          <div class="flex aic gap6" style="margin-bottom:6px">
-            <div style="flex:1;font-size:12px;color:var(--inkMid);line-height:1.5">${linkifyNote(nt)}</div>
-            <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="note-del" data-idx="${i}">×</button>
-          </div>`).join("") : `<div class="muted" style="font-size:11px;margin-bottom:6px">還沒有備註。可貼網址，會自動變可點連結。</div>`}
-        ${notes.length<5?`
-          <div class="flex gap6 mt6">
-            <input type="text" data-note="draft" value="${esc(S.noteDraft||"")}" placeholder="輸入重點或貼上 https://… " style="flex:1">
-            <button class="btn btn-secondary" data-act="note-add">＋ 加</button>
-          </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
-      </div>`;
-
-      // metadata row (Project/Branch/Work) — priority · deadline · owner · link
+      // metadata row for project/branch/work (no priority cycle now — pin lives on Daily)
       const showMeta = node.type!=="portfolio";
-      const prc = PRIORITY_CFG[getPriority(node)]||PRIORITY_CFG.normal;
       const lk = getLink(node);
       const metaRow = showMeta ? html`
       <div class="card" style="padding:11px 13px;margin-bottom:12px">
         <div class="flex aic gap8 wrap" style="font-size:11px">
-          <button class="btn btn-ghost sm" data-act="cycle-priority" data-id="${node.id}" style="padding:3px 9px">${prc.i} ${prc.label}</button>
           ${effDeadline(node)?`<span style="color:var(--inkMid)">📅 ${fmt(effDeadline(node))}</span>`:`<span class="muted">無交期</span>`}
-          ${getOwner(node)?`<span style="color:var(--inkMid)">👤 ${esc(getOwner(node))}</span>`:""}
+          ${isPinned(node)?`<span style="color:var(--bamboo)">📌 已釘選</span>`:""}
           ${lk?`<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
         </div>
       </div>` : "";
 
+      // notes = reference / facts (≤5, clickable URLs)
+      const notes = getNotes(node);
+      const notesBlock = html`
+      <div class="card" style="padding:12px 14px;margin-bottom:14px;background:var(--bambooBg);border-color:rgba(184,168,120,.35)">
+        <div class="flex between aic mb8"><span class="label" style="margin:0">📌 備註・參考・連結（${notes.length}/5）</span></div>
+        ${notes.length? notes.map((nt,i)=>`
+          <div class="flex aic gap6" style="margin-bottom:6px">
+            <div style="flex:1;font-size:12px;color:var(--inkMid);line-height:1.5">${linkifyNote(nt)}</div>
+            <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="note-del" data-idx="${i}">×</button>
+          </div>`).join("") : `<div class="muted" style="font-size:11px;margin-bottom:6px">參考資料 / 事實 / 連結放這裡。</div>`}
+        ${notes.length<5?`
+          <div class="flex gap6 mt6">
+            <input type="text" data-note="draft" value="${esc(S.noteDraft||"")}" placeholder="輸入參考或貼上 https://…" style="flex:1">
+            <button class="btn btn-secondary" data-act="note-add">＋ 加</button>
+          </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
+      </div>`;
+
       // checklist (Work only)
       let checklistBlock = "";
       if(node.type==="work"){
-        const cl = node.checklist||[];
-        const st = checklistStats(node);
+        const cl = node.checklist||[]; const st = checklistStats(node);
         checklistBlock = html`
         <div class="card" style="padding:12px 14px;margin-bottom:12px">
-          <div class="flex between aic mb8">
-            <span class="label" style="margin:0">☑ 子任務 Checklist ${st.total?`（${st.done}/${st.total}）`:""}</span>
-          </div>
+          <div class="flex between aic mb8"><span class="label" style="margin:0">☑ 子任務 ${st.total?`（${st.done}/${st.total}）`:""}</span></div>
           ${cl.map((c,i)=>`
             <div class="flex aic gap8" style="margin-bottom:5px">
               <button class="btn btn-ghost" style="padding:2px 7px" data-act="chk-toggle" data-idx="${i}">${c.done?"☑":"☐"}</button>
@@ -1380,37 +1403,29 @@
         </div>`;
       }
 
-      tabBody = html`
-      <div class="up">
-        ${metaRow}
-        ${checklistBlock}
-        ${notesBlock}
-        <p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary||"—")}</p>
-        ${maturityControl}
-        <div class="divider"></div>
-        <div class="row2" style="gap:10px 16px">
-          ${facts.map(([k,v])=>`<div><span class="label">${k}</span><div style="font-size:12px;color:var(--inkMid)">${esc(v)}</div></div>`).join("")}
-        </div>
-        ${stake}${tags}
-      </div>`;
-    }
-    else if(S.detailTab==="timeline"){
-      const logs = (node.logs||[]).slice().reverse().map(g=>{
-        const cfg = LOG_TYPE_CFG[g.type]||LOG_TYPE_CFG.note;
-        const msg = g.message!=null?g.message:(g.content||"");
-        return `
-        <div class="log">
-          <div class="dot" style="color:${cfg.c}">${cfg.i}</div>
-          <div class="body">
-            <div class="meta">${fmt(g.date)} · <span style="color:${cfg.c}">${cfg.label}</span></div>
-            <div class="content">${esc(msg)}</div>
-          </div>
-        </div>`;}).join("");
-      tabBody = html`
-      <div class="up">
-        <div class="card" style="padding:13px;margin-bottom:14px">
-          <span class="label">快速記一筆 Quick log</span>
-          <textarea data-det="logText" rows="2" placeholder="發生了什麼…">${esc(det.logText)}</textarea>
+      // logs = historical events. For a Project, unify all descendant logs here.
+      let logSource;
+      if(node.type==="project"||node.type==="portfolio"){
+        logSource = [];
+        (function walk(id){ childrenOf(S.nodes,id).forEach(c=>{ (c.logs||[]).forEach(l=>logSource.push({l,from:c})); walk(c.id); }); })(node.id);
+        (node.logs||[]).forEach(l=>logSource.push({l,from:node}));
+        logSource.sort((a,b)=> (b.l.date||"").localeCompare(a.l.date||""));
+      } else {
+        logSource = (node.logs||[]).slice().reverse().map(l=>({l,from:node}));
+      }
+      const logsHtml = logSource.map(({l,from})=>{
+        const cfg = LOG_TYPE_CFG[l.type]||LOG_TYPE_CFG.note;
+        const msg = l.message!=null?l.message:(l.content||"");
+        const tag = (from.id!==node.id) ? `<span style="font-size:9px;color:var(--inkLight)"> · ${esc(from.title)}</span>` : "";
+        return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
+          <div class="body"><div class="meta">${fmt(l.date)} · <span style="color:${cfg.c}">${cfg.label}</span>${tag}</div>
+          <div class="content">${esc(msg)}</div></div></div>`;
+      }).join("");
+
+      const logBlock = html`
+        <div class="sect">${(node.type==="project"||node.type==="portfolio")?"歷程 Log（含底下各工項/待辦）":"歷程 Log"}</div>
+        <div class="card" style="padding:13px;margin-bottom:12px">
+          <textarea data-det="logText" rows="2" placeholder="記一筆：發生了什麼…">${esc(det.logText)}</textarea>
           <div class="flex gap6 wrap" style="margin-top:8px">
             <button class="btn sm" style="background:var(--mossBg);color:var(--moss)" data-act="addlog" data-type="progress">＋ 進度</button>
             <button class="btn sm" style="background:var(--slateBg);color:var(--slate)" data-act="addlog" data-type="decision">＋ 決策</button>
@@ -1419,35 +1434,52 @@
             <button class="btn sm" style="background:var(--bambooBg);color:var(--bamboo)" data-act="addlog" data-type="milestone">＋ 里程碑</button>
           </div>
         </div>
-        ${logs || `<div class="empty">尚無記錄</div>`}
+        ${logsHtml || `<div class="empty">尚無記錄</div>`}`;
+
+      tabBody = html`
+      <div class="up">
+        ${summaryBlock}
+        ${stake}
+        ${metaRow}
+        ${checklistBlock}
+        ${notesBlock}
+        ${maturityControl}
+        ${logBlock}
       </div>`;
     }
-    else if(S.detailTab==="children"){
-      let kidsHtml = kids.length
-        ? kids.map(k=>`
-          <div class="node-row" style="border-left:3px solid ${TYPE_CFG[k.type].c}" data-act="open" data-id="${k.id}">
-            <div class="grow"><div style="font-size:12px;font-weight:600">${esc(k.title)}</div>
-              <div class="sub">${childrenOf(ns,k.id).length} children</div></div>
-            ${maturityPill(k)}${typePill(k.type)}
-          </div>`).join("")
-        : `<div class="empty">No children 無下層節點</div>`;
-      const allDone = kids.length>0 && kids.every(k=>k.executionStage==="complete"||k.workStatus==="done");
-      let suggestion = "";
-      if(allDone){
-        suggestion = html`
-        <div style="background:var(--mossBg);border:1px solid rgba(94,125,96,.3);border-radius:var(--rsm);padding:12px;margin-top:10px">
-          <div style="font-size:11px;font-weight:600;color:var(--moss);margin-bottom:6px">All children complete — your call 全部完成，由你決定</div>
-          ${node.type==="portfolio"?`<div class="flex gap6">
-            <button class="btn btn-ghost sm" data-act="set-maturity" data-val="archived">Archive 封存</button>
-            <button class="btn btn-ghost sm" data-act="set-maturity" data-val="frozen">Freeze 凍結</button>
-            <button class="btn btn-ghost sm" data-act="noop">Keep Active 維持</button>
-          </div>`:""}
+    else {
+      // ── 工項 Branch: overview of all branch(工項)/work(待辦) under this node; edit & move ──
+      function row(n, depth){
+        const isHi = S.highlightId===n.id;
+        const cl = n.type==="work"?checklistStats(n):null;
+        const dd = effDeadline(n);
+        return `
+        <div class="node-row" style="margin-left:${depth*14}px;border-left:3px solid ${TYPE_CFG[n.type].c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
+          <div class="grow tap" data-act="open" data-id="${n.id}">
+            <div style="font-size:12px;font-weight:${n.type==="work"?"700":"600"}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
+            <div class="sub">${S.advanced?lbl(n.type):FRIENDLY[n.type]||n.type}${dd?" · "+fmt(dd):""}${cl&&cl.total?` · ☑${cl.done}/${cl.total}`:""}</div>
+          </div>
+          <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px">⇄</button>
         </div>`;
       }
-      tabBody = `<div class="up">${kidsHtml}${suggestion}</div>`;
+      let listHtml = "";
+      (function walk(id, depth){
+        childrenOf(S.nodes,id).forEach(c=>{
+          if(c.type==="branch"||c.type==="work"){ listHtml += row(c, depth); walk(c.id, depth+1); }
+          else walk(c.id, depth);
+        });
+      })(node.id);
+      tabBody = html`
+      <div class="up">
+        <div class="muted" style="font-size:11px;margin-bottom:10px">本${node.type==="project"?"專案":node.type==="portfolio"?"對象":"項目"}底下的工項與待辦。點項目可編輯，⇄ 可搬移。</div>
+        ${listHtml || `<div class="empty">底下還沒有工項/待辦</div>`}
+      </div>`;
     }
 
-    return header + `<div class="pad-wide" style="padding:16px 18px 100px">${transformPanel}${tabBody}</div>`;
+    // clear highlight after it has rendered once
+    if(S.highlightId) setTimeout(()=>{ S.highlightId=null; }, 1200);
+
+    return header + `<div class="pad-wide" style="padding:16px 18px 100px">${tabBody}</div>`;
   }
 
   /* ─── IMPORT ───────────────────────────────────────────────────────────── */
@@ -1870,6 +1902,7 @@
           if((v==="capture"||v==="import")&&S.role==="factory") return;
           S.selectedId=null; S.view=v; render(); break; }
         case "open": S.selectedId=t.getAttribute("data-id"); S.view="detail"; S.detailTab="info"; det.showTransform=false; render(); break;
+        case "open-from-daily": openFromDaily(t.getAttribute("data-id")); break;
         case "back": S.selectedId=null; S.view="daily"; render(); break;
         case "tab": S.detailTab=t.getAttribute("data-tab"); render(); break;
         case "toggle": { const id=t.getAttribute("data-id"); S.expanded[id]=!S.expanded[id]; render(); e.stopPropagation(); break; }
@@ -1964,6 +1997,19 @@
   }
   function doPin(id){
     updateNode(id, n=>{ n.tags=togglePin(n); return n; });
+    render();
+  }
+  // Daily → Project deep link: open the owning project's detail, branch tab, highlight the work
+  function openFromDaily(workId){
+    const n = byId(S.nodes, workId);
+    const pid = n ? ownerProjectId(n, S.nodes) : null;
+    if(pid){
+      S.selectedId = pid; S.view="detail"; S.detailTab="branch"; S.highlightId = workId;
+    } else {
+      // leaf branch/project with no project ancestor → open itself
+      S.selectedId = workId; S.view="detail"; S.detailTab = n&&n.type==="project"?"branch":"info"; S.highlightId = workId;
+    }
+    det.showTransform=false;
     render();
   }
   function noteAdd(){
