@@ -779,7 +779,7 @@
   function bottomNav(){
     const items = S.role==="factory"
       ? [["daily","Daily 焦點","☀"],["portfolio","Account 對象","◉"],["export","Export 匯出","⤓"],["settings","Setup 設定","⚙"]]
-      : [["daily","Daily 焦點","☀"],["capture","Capture 擷取","✱"],["portfolio","Account 對象","◉"],
+      : [["daily","Daily 焦點","☀"],["capture","Input 輸入","✱"],["portfolio","Account 對象","◉"],
          ["import","Import 匯入","⤒"],["export","Export 匯出","⤓"],["settings","Setup 設定","⚙"]];
     return `<nav class="bottomnav">` + items.map(([id,label,ic])=>`
       <button data-act="nav" data-view="${id}" class="${S.view===id?"on":""}">
@@ -883,6 +883,12 @@
     let cur=n.parentId?byId(ns,n.parentId):null, g=0;
     while(cur && g++<5){ if(cur.type==="project") return cur.id; cur=cur.parentId?byId(ns,cur.parentId):null; }
     return n.type==="project"?n.id:null;
+  }
+  // the Project a log should attach to when adding a child under parentId
+  function projectAncestor(ns, parentId, mode){
+    let cur = byId(ns, parentId), g=0;
+    while(cur && g++<6){ if(cur.type==="project") return cur; cur=cur.parentId?byId(ns,cur.parentId):null; }
+    return null;
   }
 
   // a single Daily card: work OR dated leaf branch/project. 3 buttons + pin.
@@ -991,136 +997,141 @@
   // capture session state.
   //  pick = { mode:'update'|'work'|'branch'|'project'|'account', parentId } chosen from tree
   //  nexts = list of 待辦(work) titles when creating work (multiple)
+  // Input flow: choose/create Account → tree-pick to add child (confirm hierarchy) → optional log
   const cap = { images:[], signal:"screenshot",
-                q_what:"", q_kind:"", q_ball:"", q_next:"",
-                nexts:[], link:"", dday:"", title:"", mode:"explore",
-                pick:null /* {mode,parentId} */ };
+                accountId:null,      // chosen existing Account (portfolio) id
+                newAccountName:"",   // when creating a new Account
+                newAccountMode:"explore",
+                link:"", dday:"", title:"", mode:"explore",
+                pick:null,           // {mode,parentId} chosen from the tree under accountId
+                nexts:[],            // multiple work titles
+                logText:"", logDate:"", logType:"progress",  // optional log (on Project level)
+                q_ball:"" };
   function viewCapture(){
     const ns = S.nodes;
     const codes = buildCodes(ns);
-    const right = `<button class="btn btn-ghost sm" data-act="toggle-advanced">${S.advanced?"●":"○"} ${S.advanced?"Advanced":"Simple"}</button>`;
+    const right = `<button class="btn btn-ghost sm" data-act="toggle-advanced">${S.advanced?"\u25cf":"\u25cb"} ${S.advanced?"Advanced":"Simple"}</button>`;
+    const accounts = ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
+    const acct = cap.accountId ? byId(ns, cap.accountId) : null;
 
-    const imgThumbs = cap.images.length
-      ? `<div class="flex gap6 wrap" style="margin-top:8px">${cap.images.map((src,i)=>`<div style="position:relative"><img src="${src}" style="width:64px;height:64px;object-fit:cover;border-radius:var(--rsm);border:1px solid var(--border)"><button data-act="cap-rmimg" data-idx="${i}" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--clay);color:#fff;border:none;font-size:11px">×</button></div>`).join("")}</div>`
-      : "";
+    // STAGE 1: no account chosen yet → choose existing or create new
+    if(!acct){
+      return html`
+      ${topbar("Input \u8f38\u5165", "\u9078\u5c0d\u8c61 \u2192 \u52a0\u5b50\u9805 \u2192 \uff08\u9078\u586b\uff09log", right)}
+      <div class="pad">
+        <div class="note-muted" style="border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:11px;line-height:1.6">
+          \u5148\u9078\u4e00\u500b\u5c0d\u8c61\uff08Account\uff09\uff0c\u6216\u65b0\u5efa\u4e00\u500b\u3002\u9078\u5b9a\u5f8c\u624d\u6703\u51fa\u73fe\u6a39\u72c0\u5716\u8b93\u4f60\u52a0\u5b50\u9805\u3002
+        </div>
 
-    // ── tree picker: every node is a target; each level offers "add child here" ──
+        <div class="sect">\u2795 \u65b0\u5efa\u5c0d\u8c61 Account</div>
+        <div class="card" style="padding:12px">
+          <div class="field"><span class="label">\u5c0d\u8c61\u540d\u7a31</span>
+            <input type="text" data-cap="newAccountName" value="${esc(cap.newAccountName)}" placeholder="\u4f8b\uff1a\u67d0\u5ba2\u6236 / \u67d0\u8a08\u756b"></div>
+          <div class="field"><span class="label">\u985e\u578b Mode</span>
+            <select data-cap="newAccountMode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.newAccountMode===m?"selected":""}>${S.advanced?lbl(m):({deliver:"\u8981\u4ea4\u4ed8\u7684",build:"\u8981\u5efa\u69cb\u7684",explore:"\u8981\u63a2\u7d22\u7684"}[m])}</option>`).join("")}</select></div>
+          <button class="btn btn-primary full" data-act="cap-newaccount" ${cap.newAccountName.trim()?"":"disabled"}>\u5efa\u7acb\u4e26\u9078\u5b9a</button>
+        </div>
+
+        <div class="sect">\u6216\uff1a\u9078\u73fe\u6709\u5c0d\u8c61</div>
+        <div class="card" style="padding:8px 10px">
+          ${accounts.length? accounts.map(a=>`
+            <button class="btn btn-ghost full mb6" style="justify-content:flex-start" data-act="cap-pickaccount" data-id="${a.id}">
+              \u25c9 ${esc(a.title)} <span style="color:var(--inkLight);font-size:10px;margin-left:6px">${childrenOf(ns,a.id).filter(n=>n.type==="project").length} \u500b\u5c08\u6848</span>
+            </button>`).join("") : `<div class="muted" style="font-size:11px;padding:6px">\u9084\u6c92\u6709\u5c0d\u8c61\uff0c\u5148\u65b0\u5efa\u4e00\u500b\u3002</div>`}
+        </div>
+      </div>`;
+    }
+
+    // STAGE 2: account chosen → tree (add child) + optional log
     const pick = cap.pick;
     function pickedLabel(){
       if(!pick) return "";
-      if(pick.mode==="account") return "➕ 新對象（Account）";
       const p = byId(ns, pick.parentId);
-      const childWord = { update:"記一筆進度到", work:"新待辦於", branch:"新工項於", project:"新專案於" }[pick.mode];
-      return `${childWord}：${p?(codes[p.id]?codes[p.id]+" ":"")+p.title:""}`;
+      const childWord = { work:"\u65b0\u5f85\u8fa6\u65bc", branch:"\u65b0\u5de5\u9805\u65bc", project:"\u65b0\u5c08\u6848\u65bc" }[pick.mode];
+      return `${childWord}\uff1a${p?(codes[p.id]?codes[p.id]+" ":"")+p.title:""}`;
     }
     function treeNode(n, depth){
       const indent = depth*14;
       const kids = childrenOf(ns,n.id);
-      let addBtn = "";
-      // what child can this node accept?
       const childMode = { portfolio:"project", project:"branch", branch:"work" }[n.type];
-      const childWord = { project:"➕新專案", branch:"➕新工項", work:"➕新待辦" }[childMode];
+      const childWord = { project:"\u2795\u65b0\u5c08\u6848", branch:"\u2795\u65b0\u5de5\u9805", work:"\u2795\u65b0\u5f85\u8fa6" }[childMode];
       const isPickedAdd = pick && pick.mode===childMode && pick.parentId===n.id;
-      const isPickedUpd = pick && pick.mode==="update" && pick.parentId===n.id;
       let out = `
         <div style="margin-left:${indent}px;display:flex;align-items:center;gap:6px;padding:3px 0">
-          <button class="btn ${isPickedUpd?'btn-moss':'btn-ghost'}" style="padding:3px 8px;font-size:11px;flex:1;justify-content:flex-start;text-align:left"
-            data-act="cap-pick" data-mode="update" data-pid="${n.id}">
-            ${codes[n.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[n.id]}</span> `:""}${esc(n.title)}
-          </button>
+          <span style="flex:1;font-size:11px;color:var(--inkMid)">${codes[n.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[n.id]}</span> `:""}${esc(n.title)}</span>
           ${childMode?`<button class="btn ${isPickedAdd?'btn-moss':'btn-secondary'}" style="padding:3px 8px;font-size:10px;white-space:nowrap" data-act="cap-pick" data-mode="${childMode}" data-pid="${n.id}">${childWord}</button>`:""}
         </div>`;
       kids.forEach(k=>{ out += treeNode(k, depth+1); });
       return out;
     }
-    const accounts = ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId);
-    const treeHtml = accounts.map(a=>treeNode(a,0)).join("") || `<div class="muted" style="font-size:11px;padding:8px 0">目前沒有對象，請先開一個。</div>`;
+    const treeHtml = treeNode(acct, 0);
 
-    // ── detail block depends on the chosen pick mode ──
+    // detail block for the picked add-target
     let detailBlock = "";
     if(pick){
       if(pick.mode==="work"){
-        // multiple 待辦
-        const chips = cap.nexts.map((t,i)=>`<div class="flex aic gap6" style="margin-bottom:4px"><span class="tag" style="flex:1;text-align:left">${esc(t)}</span><button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="cap-rmnext" data-idx="${i}">×</button></div>`).join("");
+        const chips = cap.nexts.map((t,i)=>`<div class="flex aic gap6" style="margin-bottom:4px"><span class="tag" style="flex:1;text-align:left">${esc(t)}</span><button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="cap-rmnext" data-idx="${i}">\u00d7</button></div>`).join("");
         detailBlock = html`
           <div class="card" style="padding:12px;margin-top:12px">
-            <span class="label">待辦清單（可多筆 Work items）</span>
-            ${chips || `<div class="muted" style="font-size:11px;margin-bottom:6px">至少加一筆。或直接用上面「下一步」的內容。</div>`}
+            <span class="label">\u5f85\u8fa6\u6e05\u55ae\uff08\u53ef\u591a\u7b46\uff09</span>
+            ${chips}
             <div class="flex gap6">
-              <input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="一個待辦動作" style="flex:1">
-              <button class="btn btn-secondary" data-act="cap-addnext">＋ 加待辦</button>
+              <input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="\u4e00\u500b\u5f85\u8fa6\u52d5\u4f5c" style="flex:1">
+              <button class="btn btn-secondary" data-act="cap-addnext">\uff0b \u52a0\u5f85\u8fa6</button>
             </div>
             <div class="row2 mt10">
-              <div class="field"><span class="label">交期 D-DAY（可空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
-              <div class="field"><span class="label">連結（可空）</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://…"></div>
+              <div class="field"><span class="label">\u4ea4\u671f D-DAY\uff08\u53ef\u7a7a\uff09</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
+              <div class="field"><span class="label">\u9023\u7d50\uff08\u53ef\u7a7a\uff09</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://\u2026"></div>
             </div>
           </div>`;
-      } else if(pick.mode==="update"){
-        detailBlock = html`<div class="note-muted" style="border-radius:var(--rsm);padding:10px 12px;margin-top:12px;font-size:11px">這筆會以「發生什麼事」記成一條進度（並同步記到所屬對象的歷程）。</div>`;
-      } else if(pick.mode==="account"){
+      } else {
+        const word = pick.mode==="project"?"\u5c08\u6848":"\u5de5\u9805";
         detailBlock = html`
           <div class="card" style="padding:12px;margin-top:12px">
-            <div class="field"><span class="label">對象名稱 Account</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="例：某客戶 / 某計畫"></div>
-            <div class="field"><span class="label">類型 Mode</span>
-              <select data-cap="mode">${["deliver","build","explore"].map(m=>`<option value="${m}" ${cap.mode===m?"selected":""}>${S.advanced?lbl(m):({deliver:"要交付的",build:"要建構的",explore:"要探索的"}[m])}</option>`).join("")}</select></div>
-          </div>`;
-      } else { // branch / project
-        const word = pick.mode==="project"?"專案":"工項";
-        detailBlock = html`
-          <div class="card" style="padding:12px;margin-top:12px">
-            <div class="field"><span class="label">${word}名稱</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="這個${word}叫什麼"></div>
+            <div class="field"><span class="label">${word}\u540d\u7a31</span><input type="text" data-cap="title" value="${esc(cap.title)}" placeholder="\u9019\u500b${word}\u53eb\u4ec0\u9ebc"></div>
             <div class="row2">
-              <div class="field"><span class="label">交期 D-DAY（可空）</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
-              <div class="field"><span class="label">連結（可空）</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://…"></div>
+              <div class="field"><span class="label">\u4ea4\u671f D-DAY\uff08\u53ef\u7a7a\uff09</span><input type="date" data-cap="dday" value="${esc(cap.dday)}"></div>
+              <div class="field"><span class="label">\u9023\u7d50\uff08\u53ef\u7a7a\uff09</span><input type="text" data-cap="link" value="${esc(cap.link)}" placeholder="https://\u2026"></div>
             </div>
           </div>`;
       }
     }
 
-    const disabled = capCommitDisabled();
+    // optional log — always lands on the owning Project level; date selectable
+    const logProject = pick ? projectAncestor(ns, pick.parentId, pick.mode) : null;
+    const logBlock = html`
+      <div class="sect">\uff08\u9078\u586b\uff09\u8a18\u4e00\u7b46 log \u2014 \u8a18\u5728\u5c08\u6848\u5c64</div>
+      <div class="card" style="padding:12px">
+        ${logProject?`<div class="muted" style="font-size:10px;margin-bottom:8px">\u6703\u8a18\u5230\u5c08\u6848\uff1a<b>${esc(logProject.title)}</b></div>`:`<div class="muted" style="font-size:10px;margin-bottom:8px">\u9078\u4e0a\u9762\u4e00\u500b\u4f4d\u7f6e\u5f8c\uff0clog \u6703\u81ea\u52d5\u6b78\u5230\u6240\u5c6c\u5c08\u6848\u3002</div>`}
+        <textarea data-cap="logText" rows="2" placeholder="\u767c\u751f\u4e86\u4ec0\u9ebc\uff08\u53ef\u7559\u7a7a\uff09\u2026">${esc(cap.logText)}</textarea>
+        <div class="row2 mt8">
+          <div class="field"><span class="label">\u65e5\u671f</span><input type="date" data-cap="logDate" value="${esc(cap.logDate||todayStr())}"></div>
+          <div class="field"><span class="label">\u985e\u578b</span>
+            <select data-cap="logType">${["progress","decision","blocker","note","milestone"].map(k=>`<option value="${k}" ${cap.logType===k?"selected":""}>${(LOG_TYPE_CFG[k]||{}).label||k}</option>`).join("")}</select></div>
+        </div>
+      </div>`;
+
+    const canCommit = !!pick && (pick.mode!=="work" ? !!cap.title.trim() : (cap.nexts.length>0||cap.title.trim()));
 
     return html`
-    ${topbar("Capture 擷取", `${cap.images.length} 張截圖 · 一個 session`, right)}
+    ${topbar("Input \u8f38\u5165", esc(acct.title), right)}
     <div class="pad">
-      <div class="note-muted" style="border-radius:var(--r);padding:12px 14px;margin-bottom:16px;font-size:11px;line-height:1.6">
-        先選既有對象或開新對象，再從結構點位置放。可一次建多個專案/工項/待辦，最後一起確認。
+      <div class="flex between aic" style="margin-bottom:12px">
+        <div style="font-size:13px;font-weight:600">\u25c9 ${esc(acct.title)}</div>
+        <button class="btn btn-ghost sm" data-act="cap-clearaccount">\u63db\u5c0d\u8c61</button>
       </div>
 
-      <div class="sect">① 既有對象 / 新增對象</div>
+      <div class="sect">\u2460 \u5728\u6a39\u72c0\u5716\u52a0\u5b50\u9805\uff08\u78ba\u8a8d\u968e\u5c64\uff09</div>
       <div class="card" style="padding:10px 12px">
-        <button class="btn ${pick&&pick.mode==='account'?'btn-moss':'btn-secondary'} full mb8" style="justify-content:flex-start" data-act="cap-pick" data-mode="account" data-pid="">➕ 開一個全新的對象（Account）</button>
-        <div class="muted" style="font-size:10px;margin:2px 2px 6px">或從既有結構點一個位置（每層可加子項）：</div>
         <div style="max-height:240px;overflow:auto">${treeHtml}</div>
       </div>
-      ${pick?`<div class="note-muted" style="border-radius:var(--rsm);padding:8px 12px;margin-top:10px;font-size:11px;color:var(--moss)">已選：${esc(pickedLabel())}</div>`:""}
-
-      <div class="sect">② 發生什麼事？（記成專案歷程 log，預設今天）</div>
-      <div class="field"><textarea data-cap="q_what" rows="2" placeholder="一兩句話描述">${esc(cap.q_what)}</textarea></div>
-
-      <div class="sect">③ 下一步</div>
-      <div class="field"><input type="text" data-cap="q_next" value="${esc(cap.q_next)}" placeholder="例：等工廠回報價"></div>
-
+      ${pick?`<div class="note-muted" style="border-radius:var(--rsm);padding:8px 12px;margin-top:10px;font-size:11px;color:var(--moss)">\u5df2\u9078\uff1a${esc(pickedLabel())}</div>`:""}
       ${detailBlock}
 
-      <div class="sect" style="color:var(--inkLight)">球在誰手上？（dispatch 才會用到）</div>
-      <div class="field">
-        <div class="seg">
-          ${[["me","我"],["them","對方"],["waiting","等待"],["shared","共同"]].map(([v,t])=>`<button data-cap-pick="q_ball" data-val="${v}" class="${cap.q_ball===v?"on":""}" style="${cap.q_ball===v?"background:var(--ink);color:#fff":""}">${t}</button>`).join("")}
-        </div>
-      </div>
+      ${pick?logBlock:""}
 
-      <div class="sect" style="color:var(--inkLight)">截圖（未串 AI，目前僅留存）</div>
-      <div class="drop" data-act="pickimg" id="capdrop">
-        <div style="font-size:18px;margin-bottom:4px">📷</div>
-        <div style="font-size:11px;color:var(--inkMid)">點擊新增截圖（可多張）</div>
-        <input type="file" accept="image/*" multiple id="capimg" style="display:none">
-      </div>
-      ${imgThumbs}
-
-      <button class="btn btn-primary full mt14" data-act="cap-commit" ${disabled?"disabled":""}>
-        ${pick&&pick.mode==="account"?"建立對象（確認）":pick&&pick.mode==="update"?"記錄進度":"建立並歸位"}
-      </button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">由你確認，不自動建立。</div>
+      <button class="btn btn-primary full mt14" data-act="cap-commit" ${canCommit?"":"disabled"}>\u5efa\u7acb\u4e26\u6b78\u4f4d</button>
+      <div class="center muted" style="font-size:10px;margin-top:8px">\u7531\u4f60\u78ba\u8a8d\uff0c\u4e0d\u81ea\u52d5\u5efa\u7acb\u3002</div>
     </div>`;
   }
 
@@ -1933,8 +1944,11 @@
         case "transform": doTransform(t.getAttribute("data-to"), t.getAttribute("data-freeze")==="1"); break;
         case "addlog": addLog(t.getAttribute("data-type")); break;
         case "cap-commit": capCommit(); break;
+        case "cap-newaccount": capNewAccount(); break;
+        case "cap-pickaccount": cap.accountId=t.getAttribute("data-id"); cap.pick=null; render(); break;
+        case "cap-clearaccount": cap.accountId=null; cap.pick=null; cap.title=""; cap.nexts=[]; cap.logText=""; render(); break;
         case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
-        case "cap-pick": { cap.pick={ mode:t.getAttribute("data-mode"), parentId:t.getAttribute("data-pid")||null }; cap.title=""; render(); break; }
+        case "cap-pick": { cap.pick={ mode:t.getAttribute("data-mode"), parentId:t.getAttribute("data-pid")||null }; cap.title=""; cap.nexts=[]; render(); break; }
         case "cap-addnext": { const v=(cap.title||"").trim(); if(v){ cap.nexts.push(v); cap.title=""; } render(); break; }
         case "cap-rmnext": { const i=+t.getAttribute("data-idx"); cap.nexts.splice(i,1); render(); break; }
         case "pickimg": document.getElementById("capimg").click(); break;
@@ -1956,6 +1970,7 @@
       if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value;
         // re-render only when target changes structure (parent options differ per target)
         if(el.getAttribute("data-cap")==="target"){ cap.parentId=""; render(); return; }
+        if(el.getAttribute("data-cap")==="newAccountName"){ const b=root.querySelector('[data-act="cap-newaccount"]'); if(b) b.disabled=!el.value.trim(); return; }
         // otherwise just refresh the commit button's disabled state live (preserve focus)
         refreshCapCommit();
         return;
@@ -2167,108 +2182,76 @@
   function capCommitDisabled(){
     const p = cap.pick;
     if(!p) return true;
-    if(p.mode==="update") return false;                       // just logs
-    if(p.mode==="account") return !cap.title.trim();
-    if(p.mode==="work") return !(cap.nexts.length>0 || cap.title.trim() || cap.q_next.trim());
-    // branch / project
-    return !cap.title.trim();
+    if(p.mode==="work") return !(cap.nexts.length>0 || cap.title.trim());
+    return !cap.title.trim();   // project / branch
   }
   function refreshCapCommit(){
     const btn = document.querySelector('[data-act="cap-commit"]');
     if(btn) btn.disabled = capCommitDisabled();
   }
-  function capSummary(){
-    const ballMap={me:"球在我",them:"球在對方",waiting:"等待中",shared:"共同"};
-    const bits=[];
-    if(cap.q_what) bits.push(cap.q_what);
-    if(cap.q_ball) bits.push("【"+(ballMap[cap.q_ball]||cap.q_ball)+"】");
-    return bits.join(" ");
-  }
-  function capResetForm(){
-    cap.images=[]; cap.signal="screenshot";
-    cap.q_what=""; cap.q_kind=""; cap.q_ball=""; cap.q_next="";
-    cap.nexts=[]; cap.link=""; cap.dday=""; cap.title=""; cap.mode="explore"; cap.pick=null;
-  }
-  // append a dated history log to the owning Account (root portfolio)
-  function logToAccount(rootId, content, signal, att){
-    if(!rootId) return;
-    S.nodes = S.nodes.map(n=> n.id===rootId ? Object.assign({},n,{
-      logs:(n.logs||[]).concat({ id:uid("log"), date:todayStr(), signal:signal||"screenshot", content:content }),
-      attachments: att && att.length ? (n.attachments||[]).concat(att) : (n.attachments||[]),
-      lastUpdated:todayStr(), lastProgress:todayStr(), progressSignal:signal||"screenshot"
-    }) : n);
+  // ➕ create a new Account (portfolio) then select it; stay on Input
+  function capNewAccount(){
+    const name=(cap.newAccountName||"").trim(); if(!name) return;
+    const now=todayStr();
+    const id=uid("pf");
+    S.nodes = S.nodes.concat({
+      id, type:"portfolio", parentType:null, parentId:null, title:name, summary:"",
+      portfolioState:"inbox", projectMode:cap.newAccountMode||"explore",
+      tags:[], lastProgress:now, progressSignal:"manual", lastUpdated:now,
+      logs:[], attachments:[]   // Account holds no log by design
+    });
+    cap.accountId=id; cap.newAccountName=""; cap.pick=null;
+    render(); maybeSync("new-account");
   }
   function capCommit(){
     const now = todayStr();
     const p = cap.pick; if(!p) return;
     const att = cap.images.map(src=>({id:uid("att"),kind:"image",src,added:now}));
-    const summary = capSummary();
-    const whatLog = (cap.q_what||"").trim();
+    let tags=[];
+    if(cap.dday) tags.push(TAG_DDAY+cap.dday);
+    if(cap.link) tags.push(TAG_LINK+cap.link);
 
-    // resolve the owning account (root portfolio) for the chosen pick
-    function rootOf(id){ let cur=byId(S.nodes,id),g=0; while(cur&&cur.parentId&&g++<6) cur=byId(S.nodes,cur.parentId); return cur; }
-
-    if(p.mode==="update"){
-      const target = byId(S.nodes, p.parentId);
-      // log on the target itself
-      S.nodes = S.nodes.map(n=>n.id===p.parentId?Object.assign({},n,{
-        logs:(n.logs||[]).concat({id:uid("log"),date:now,signal:cap.signal,content:"📥 "+(summary||"進度")}),
-        attachments:(n.attachments||[]).concat(att),
-        lastUpdated:now, lastProgress:now, progressSignal:cap.signal
-      }):n);
-      // also log "what happened" to the owning account (history)
-      const root = rootOf(p.parentId);
-      if(root && whatLog && (!target || target.id!==root.id)) logToAccount(root.id, "📌 "+whatLog, cap.signal, null);
-
-    } else if(p.mode==="account"){
-      const id=uid("p");
-      const node={ id, type:"portfolio", parentType:null, parentId:null, title:cap.title.trim(), summary,
-        portfolioState:"inbox", projectMode:cap.mode||"explore",
-        tags:[], lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
-        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 建立對象"+(whatLog?"："+whatLog:"")}],
-        attachments:att };
-      S.nodes = S.nodes.concat(node);
-
-    } else if(p.mode==="work"){
-      // multiple 待辦 under the chosen branch
+    // create the picked child node(s)
+    let createdProjectId = null;
+    if(p.mode==="work"){
       const titles = cap.nexts.slice();
-      const lead = (cap.title||"").trim(); if(lead) titles.push(lead);
-      const q = (cap.q_next||"").trim(); if(!titles.length && q) titles.push(q);
-      let tags=[];
-      if(cap.dday) tags.push(TAG_DDAY+cap.dday);
-      if(cap.link) tags.push(TAG_LINK+cap.link);
-      const owner = cap.q_ball==="them"?"them":(cap.q_ball==="me"?"me":"");
+      const lead=(cap.title||"").trim(); if(lead) titles.push(lead);
       const made = titles.map((t,i)=>({
-        id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary,
-        workStatus:"todo", owner, firstSuccessEvent:"", deadline:cap.dday||null,
-        tags: tags.slice(),
-        lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
-        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 由擷取建立"}],
-        attachments: i===0?att:[] // attach images to first only
+        id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary:"",
+        workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:cap.dday||null,
+        tags:tags.slice(), checklist:[], metadata:{priority:"normal"},
+        lastProgress:now, progressSignal:"manual", lastUpdated:now,
+        logs:[], attachments: i===0?att:[]
       }));
       S.nodes = S.nodes.concat(made);
-      const root = rootOf(p.parentId);
-      if(root && whatLog) logToAccount(root.id, "📌 "+whatLog, cap.signal, att.length?[]:null);
-
-    } else { // branch / project
+    } else {
       const isProj = p.mode==="project";
-      let tags=[];
-      if(cap.dday) tags.push(TAG_DDAY+cap.dday);
-      if(cap.link) tags.push(TAG_LINK+cap.link);
       const node = isProj
-        ? { id:uid("pr"), type:"project", parentType:"portfolio", parentId:p.parentId, title:cap.title.trim(), summary, executionStage:"ready", stakeholders:[], firstSuccessEvent:"", deadline:cap.dday||null }
-        : { id:uid("br"), type:"branch", parentType:"project", parentId:p.parentId, title:cap.title.trim(), summary, executionStage:"ready", channel:"", firstSuccessEvent:"", deadline:cap.dday||null };
-      Object.assign(node, { tags, lastProgress:now, progressSignal:cap.signal, lastUpdated:now,
-        logs:[{id:uid("log"),date:now,signal:cap.signal,content:"📥 由擷取建立"}], attachments:att });
+        ? { id:uid("pr"), type:"project", parentType:"portfolio", parentId:p.parentId, title:cap.title.trim(), summary:"", executionStage:"ready", stakeholders:[], firstSuccessEvent:"", deadline:cap.dday||null }
+        : { id:uid("br"), type:"branch", parentType:"project", parentId:p.parentId, title:cap.title.trim(), summary:"", executionStage:"ready", channel:"", firstSuccessEvent:"", deadline:cap.dday||null };
+      Object.assign(node, { tags, metadata:{priority:"normal"}, lastProgress:now, progressSignal:"manual", lastUpdated:now, logs:[], attachments:att });
       S.nodes = S.nodes.concat(node);
-      const root = rootOf(p.parentId);
-      if(root && whatLog) logToAccount(root.id, "📌 "+whatLog, cap.signal, []);
+      if(isProj) createdProjectId = node.id;
     }
 
-    capResetForm();
-    S.view="daily";
+    // optional log → always lands on the owning PROJECT level (Account never gets logs)
+    const logText=(cap.logText||"").trim();
+    if(logText){
+      const proj = projectAncestor(S.nodes, p.parentId, p.mode) || (createdProjectId?byId(S.nodes,createdProjectId):null);
+      if(proj){
+        const date = cap.logDate || now;
+        S.nodes = S.nodes.map(n=> n.id===proj.id ? Object.assign({},n,{
+          logs:(n.logs||[]).concat({ id:uid("log"), date, type:cap.logType||"progress", message:logText }),
+          lastUpdated:now, lastProgress:date, progressSignal:"manual"
+        }) : n);
+      }
+    }
+
+    // reset for next add but KEEP the account selected (keep adding under same account)
+    cap.pick=null; cap.title=""; cap.nexts=[]; cap.link=""; cap.dday="";
+    cap.logText=""; cap.logDate=""; cap.logType="progress"; cap.images=[];
     render();
-    maybeSync("capture");
+    maybeSync("input");
   }
   function handleCapImg(files){
     const list = files && files.length ? Array.from(files) : (files?[files]:[]);
