@@ -442,6 +442,7 @@
     noteDraft:"",       // draft text for adding a note on detail
     chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
+    editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -614,7 +615,7 @@
       const res = await fetch(S.syncUrl + (S.syncUrl.indexOf("?")>-1?"&":"?") + "action=load", { method:"GET" });
       const data = await res.json();
       if(data && data.ok){
-        const remote = Array.isArray(data.nodes) ? data.nodes : [];
+        const remote = Array.isArray(data.nodes) ? data.nodes.map(migrateNode) : [];
         if(opts.merge && S.nodes && S.nodes.length){
           // merge by id: remote is source for matched ids, keep local-only nodes
           const map = new Map(S.nodes.map(n=>[n.id,n]));
@@ -627,6 +628,8 @@
         S.syncMeta={ at:new Date().toISOString(), device:(data.device||"cloud") };
         S.syncMsg="已從雲端載入";
         persist();
+        try { _lastNodesJson = JSON.stringify(S.nodes||[]); } catch(e){}
+        S.dirty=false;
       } else { throw new Error(data && data.error ? data.error : "load failed"); }
     } catch(err){
       S.syncStatus="error"; S.syncMsg="讀取失敗：" + (err.message||err);
@@ -1130,8 +1133,8 @@
 
       ${pick?logBlock:""}
 
-      <button class="btn btn-primary full mt14" data-act="cap-commit" ${canCommit?"":"disabled"}>\u5efa\u7acb\u4e26\u6b78\u4f4d</button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">\u7531\u4f60\u78ba\u8a8d\uff0c\u4e0d\u81ea\u52d5\u5efa\u7acb\u3002</div>
+      <button class="btn btn-primary full mt14" data-act="cap-commit">建立並歸位</button>
+      <div class="center muted" style="font-size:10px;margin-top:8px">先點上面的 ➕ 選位置並填名稱，再按這裡。由你確認，不自動建立。</div>
     </div>`;
   }
 
@@ -1427,10 +1430,27 @@
       const logsHtml = logSource.map(({l,from})=>{
         const cfg = LOG_TYPE_CFG[l.type]||LOG_TYPE_CFG.note;
         const msg = l.message!=null?l.message:(l.content||"");
-        const tag = (from.id!==node.id) ? `<span style="font-size:9px;color:var(--inkLight)"> · ${esc(from.title)}</span>` : "";
+        const fromTag = (from.id!==node.id) ? `<span style="font-size:9px;color:var(--inkLight)"> · ${esc(from.title)}</span>` : "";
+        const editing = S.editLogId===l.id;
+        if(editing){
+          return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
+            <div class="body" style="flex:1">
+              <input type="text" data-editlog="msg" value="${esc(msg)}" style="width:100%;margin-bottom:6px">
+              <div class="flex gap6 aic">
+                <input type="date" data-editlog="date" value="${esc(l.date||todayStr())}" style="flex:1">
+                <button class="btn btn-primary sm" data-act="editlog-save" data-id="${l.id}" data-from="${from.id}">存</button>
+                <button class="btn btn-ghost sm" data-act="editlog-cancel">取消</button>
+              </div>
+            </div></div>`;
+        }
         return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
-          <div class="body"><div class="meta">${fmt(l.date)} · <span style="color:${cfg.c}">${cfg.label}</span>${tag}</div>
-          <div class="content">${esc(msg)}</div></div></div>`;
+          <div class="body">
+            <div class="content" style="font-size:13px;color:var(--ink)">${esc(msg)}</div>
+            <div class="meta" style="margin-top:3px">${fmt(l.date)} <span class="tag" style="background:${cfg.bg||'var(--bgMuted)'};color:${cfg.c};font-size:9px;padding:1px 6px">${cfg.label}</span>${fromTag}
+              <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px;margin-left:4px" data-act="editlog-start" data-id="${l.id}">✎</button>
+              <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px" data-act="editlog-del" data-id="${l.id}" data-from="${from.id}">×</button>
+            </div>
+          </div></div>`;
       }).join("");
 
       const logBlock = html`
@@ -1943,6 +1963,10 @@
         case "toggle-transform": det.showTransform=!det.showTransform; render(); break;
         case "transform": doTransform(t.getAttribute("data-to"), t.getAttribute("data-freeze")==="1"); break;
         case "addlog": addLog(t.getAttribute("data-type")); break;
+        case "editlog-start": S.editLogId=t.getAttribute("data-id"); S.editLogMsg=""; S.editLogDate=""; render(); break;
+        case "editlog-cancel": S.editLogId=null; render(); break;
+        case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
+        case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "cap-commit": capCommit(); break;
         case "cap-newaccount": capNewAccount(); break;
         case "cap-pickaccount": cap.accountId=t.getAttribute("data-id"); cap.pick=null; render(); break;
@@ -1979,6 +2003,7 @@
       if(el.hasAttribute("data-more")){ const k=el.getAttribute("data-more"); if(k==="title")S.moreTitle=el.value; if(k==="dday")S.moreDday=el.value; return; }
       if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
       if(el.hasAttribute("data-chk")){ S.chkDraft=el.value; return; }
+      if(el.hasAttribute("data-editlog")){ const k=el.getAttribute("data-editlog"); if(k==="msg")S.editLogMsg=el.value; if(k==="date")S.editLogDate=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
@@ -2000,6 +2025,14 @@
       if(el.id==="capimg"){ handleCapImg(el.files); return; }
       if(el.id==="importfile"){ handleImportFile(el.files[0]); return; }
     };
+    // Chinese IME: 'input' may not fire during composition — capture the final value
+    root.addEventListener("compositionend", e=>{
+      const el=e.target;
+      if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value; refreshCapCommit(); }
+      if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; }
+      if(el.hasAttribute("data-note")) S.noteDraft=el.value;
+      if(el.hasAttribute("data-chk")) S.chkDraft=el.value;
+    });
   }
 
   /* ─── actions ──────────────────────────────────────────────────────────── */
@@ -2063,8 +2096,7 @@
     const np = byId(S.nodes, newParentId); if(!np) return;
     const now = todayStr();
     S.nodes = S.nodes.map(n=> n.id===node.id ? Object.assign({},n,{
-      parentId:newParentId, parentType:np.type, lastUpdated:now,
-      logs:(n.logs||[]).concat(mkLog("note",`⇄ 搬移到「${np.title}」`))
+      parentId:newParentId, parentType:np.type, lastUpdated:now
     }) : n);
     S.moveFor=null;
     render();
@@ -2072,15 +2104,18 @@
   }
   // ✅ 完成 — mark done, advance progress, clear blocker tag, suggest downstream OR auto-advance
   function wDone(id){
+    const node = byId(S.nodes, id);
+    const title = node ? node.title : "";
     updateNode(id, n=>{
       if(n.type==="work"){ n.workStatus="done"; }
       else { n.executionStage="complete"; }
       n.lastUpdated=todayStr(); n.lastProgress=todayStr(); n.progressSignal="manual";
       n.tags=(n.tags||[]).filter(x=>x!=="⏸延後"); // clear deferred flag
-      n.logs=(n.logs||[]).concat(mkLog("milestone","✅ 完成"));
+      // only completion auto-logs; content-primary (the item title), status as type
+      n.logs=(n.logs||[]).concat(mkLog("milestone","完成："+title));
       return n;
     });
-    render(); // list re-sorts; the next nearest-D-DAY item surfaces automatically
+    render();
     maybeSync("done");
   }
   // ⏸ 延後 — push D-DAY by 7 days (works for dated and undated). Edit exact date in Portfolio.
@@ -2095,7 +2130,6 @@
       // mark deferred (drives auto-blocked on the parent 工項)
       if((n.tags||[]).indexOf("⏸延後")<0) n.tags.push("⏸延後");
       n.lastUpdated=todayStr();
-      n.logs=(n.logs||[]).concat(mkLog("blocker","⏸ 延後 +7 → "+iso));
       return n;
     });
     render();
@@ -2129,7 +2163,7 @@
       id:uid("wk"), type:"work", parentType:"branch", parentId:branchId, title,
       summary:"", workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:S.moreDday||null,
       tags, lastProgress:now, progressSignal:"manual", lastUpdated:now,
-      logs:[mkLog("progress","➕ 做更多新增")], attachments:[]
+      logs:[], attachments:[]
     });
     S.moreFor=null; S.moreTitle=""; S.moreDday="";
     render();
@@ -2145,7 +2179,8 @@
     render();
   }
   function addLog(type){
-    if(!det.logText.trim()) return;
+    const tEl=document.querySelector('[data-det="logText"]'); if(tEl) det.logText=tEl.value;
+    if(!det.logText.trim()) { toast("先輸入內容再選類型"); return; }
     const node = byId(S.nodes, S.selectedId); if(!node) return;
     const entry = mkLog(type||"note", det.logText.trim());
     const advance = (type==="progress"||type==="milestone");
@@ -2154,6 +2189,21 @@
     }, advance?{lastProgress:todayStr(),progressSignal:"manual"}:{})):n);
     det.logText = "";
     render(); maybeSync("log");
+  }
+  function editLogSave(logId, fromId){
+    const mEl=document.querySelector('[data-editlog="msg"]'); const dEl=document.querySelector('[data-editlog="date"]');
+    const msg = (mEl?mEl.value:S.editLogMsg).trim();
+    const date = (dEl?dEl.value:S.editLogDate)||todayStr();
+    if(!msg){ S.editLogId=null; render(); return; }
+    updateNode(fromId, n=>{
+      n.logs=(n.logs||[]).map(l=> l.id===logId ? Object.assign({},l,{message:msg,date,content:undefined}) : l);
+      return n;
+    });
+    S.editLogId=null; render(); maybeSync("log-edit");
+  }
+  function editLogDel(logId, fromId){
+    updateNode(fromId, n=>{ n.logs=(n.logs||[]).filter(l=>l.id!==logId); return n; });
+    S.editLogId=null; render(); maybeSync("log-del");
   }
   function doTransform(to, freeze){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
@@ -2178,6 +2228,16 @@
     det.showTransform=false;
     S.view="portfolio"; S.selectedId=null;
     render();
+  }
+  function toast(msg){
+    let el = document.getElementById("kiko-toast");
+    if(!el){
+      el = document.createElement("div"); el.id="kiko-toast";
+      el.style.cssText="position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--ink,#2B2926);color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;z-index:999;max-width:80%;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.25)";
+      document.body.appendChild(el);
+    }
+    el.textContent = msg; el.style.opacity="1";
+    clearTimeout(el._t); el._t=setTimeout(()=>{ el.style.opacity="0"; }, 2600);
   }
   function capCommitDisabled(){
     const p = cap.pick;
@@ -2205,7 +2265,15 @@
   }
   function capCommit(){
     const now = todayStr();
-    const p = cap.pick; if(!p) return;
+    const p = cap.pick;
+    // Sync from live DOM in case a mobile IME (composition) didn't fire 'input' into cap.*
+    const tEl = document.querySelector('[data-cap="title"]'); if(tEl) cap.title = tEl.value;
+    const lEl = document.querySelector('[data-cap="logText"]'); if(lEl) cap.logText = lEl.value;
+    const dEl = document.querySelector('[data-cap="dday"]'); if(dEl) cap.dday = dEl.value;
+    const ldEl = document.querySelector('[data-cap="logDate"]'); if(ldEl) cap.logDate = ldEl.value;
+    if(!p){ toast("請先點上面的 ➕ 選一個位置（新專案／工項／待辦）"); return; }
+    const hasContent = p.mode==="work" ? (cap.nexts.length>0 || cap.title.trim()) : !!cap.title.trim();
+    if(!hasContent){ toast(p.mode==="work"?"請輸入待辦名稱（或先按「＋加待辦」）":"請輸入名稱"); return; }
     const att = cap.images.map(src=>({id:uid("att"),kind:"image",src,added:now}));
     let tags=[];
     if(cap.dday) tags.push(TAG_DDAY+cap.dday);
@@ -2286,6 +2354,15 @@
 
   /* ─── boot ─────────────────────────────────────────────────────────────── */
   load();
+  // Prevent migration/load from marking data dirty (which could auto-push stale data
+  // over a newer cloud copy). Baseline the snapshot to the just-loaded state.
+  try { _lastNodesJson = JSON.stringify(S.nodes||[]); } catch(e){}
+  S.dirty = false;
   render();
-  if(S.syncUrl) startAutoSync();
+  // If a sync URL exists, PULL from cloud first (a freshly-opened device may hold stale
+  // local data). Only after pulling do we start auto-push, so we never overwrite a newer
+  // cloud copy with this device's old data.
+  if(S.syncUrl){
+    syncPull({alert:false, silent:true}).then(()=>{ startAutoSync(); }).catch(()=>{ startAutoSync(); });
+  }
 })();
