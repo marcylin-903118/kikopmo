@@ -440,10 +440,8 @@
     moreFor:null,       // branch id under which 做更多 adds a 待辦
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
-    chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
-    editTitleId:null,   // node whose title is being edited
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -526,8 +524,8 @@
     if(!m.metadata || typeof m.metadata!=="object") m.metadata = {};
     if(!m.metadata.priority) m.metadata.priority = "normal";
     if(m.metadata.owner==null && m.owner) m.metadata.owner = m.owner;
-    // checklist only for work
-    if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
+    // remove legacy checklist data (work is the atomic unit; checklist field no longer used)
+    if(m.type==="work"){ delete m.checklist; }
     return m;
   }
   // structured log helpers
@@ -556,9 +554,6 @@
     const n=byId(S.nodes,id); const order=["normal","critical","low"];
     const cur=getPriority(n); const next=order[(order.indexOf(cur)+1)%order.length];
     setPriority(id, next);
-  }
-  function checklistStats(n){
-    const cl=n.checklist||[]; return { done:cl.filter(c=>c.done).length, total:cl.length };
   }
   let _lastNodesJson = "";
   function persist(){
@@ -800,22 +795,12 @@
 
     // 1) in-progress leaf work
     const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId && notArchived(n));
-    // 2) loose threads: a project/branch that is itself not complete AND has NO incomplete
-    //    child (branch/work) underneath → show it so the thread isn't dropped, regardless of
-    //    D-DAY. Gains an incomplete child → disappears. All children complete → it returns.
-    //    Marking itself 完成 (complete) removes it. Account never shows.
-    function hasIncompleteChild(n){
-      return childrenOf(ns,n.id).some(c=>{
-        if(c.mergeIntoId) return false;
-        if(c.type==="work") return c.workStatus!=="done";
-        if(c.type==="branch"||c.type==="project") return c.executionStage!=="complete" || hasIncompleteChild(c);
-        return false;
-      });
-    }
-    const looseThreads = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
+    // 2) branch/project that have a D-DAY but NO child work (so Daily wouldn't otherwise show them)
+    const leafDated = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
       && n.executionStage!=="complete"
-      && !hasIncompleteChild(n));
-    const items = works.concat(looseThreads);
+      && effDeadline(n)
+      && !childrenOf(ns,n.id).some(c=>c.type==="work"));
+    const items = works.concat(leafDated);
 
     const sorted = items.slice().sort((a,b)=>{
       const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;     // pin first
@@ -1145,8 +1130,7 @@
       ${pick?logBlock:""}
 
       <button class="btn btn-primary full mt14" data-act="cap-commit">建立並歸位</button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">先點上面的 ➕ 選位置並填名稱，再按這裡。可連續建多筆。</div>
-      <button class="btn btn-secondary full mt10" data-act="cap-finish">✓ 完成，回對象頁</button>
+      <div class="center muted" style="font-size:10px;margin-top:8px">先點上面的 ➕ 選位置並填名稱，再按這裡。由你確認，不自動建立。</div>
     </div>`;
   }
 
@@ -1321,7 +1305,6 @@
     }[node.type] || [];
 
     /* header */
-    const editingTitle = S.editTitleId===node.id;
     const header = html`
     <div class="detail-head">
       <div class="flex aic gap8 mb10" style="align-items:flex-start">
@@ -1331,21 +1314,12 @@
             ${typePill(node.type)}
             ${node.mergeIntoId?pill({c:"var(--inkLight)",bg:"var(--bgMuted)",i:"⤳"},"merged"):""}
           </div>
-          ${editingTitle
-            ? `<div class="flex gap6 aic">
-                 <input type="text" data-edittitle="v" value="${esc(node.title)}" style="flex:1;font-size:16px">
-                 <button class="btn btn-primary sm" data-act="title-save" data-id="${node.id}">存</button>
-                 <button class="btn btn-ghost sm" data-act="title-cancel">取消</button>
-               </div>`
-            : `<h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}
-                 <button class="btn btn-ghost" style="padding:1px 7px;font-size:12px;vertical-align:middle" data-act="title-edit" data-id="${node.id}">✎</button>
-               </h2>`}
+          <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
         ${maturityPill(node,true)}${staleBadge(node)}
-        ${!isFactory?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">🗑 刪除</button>`:""}
         <span style="font-size:11px;color:var(--inkLight);margin-left:auto">progress ${fmt(node.lastProgress)} · ${lblEn(node.progressSignal||"manual")}</span>
       </div>
       <div class="tabs">
@@ -1369,7 +1343,7 @@
     let tabBody = "";
     const onBranchTab = S.detailTab==="branch";
     if(!onBranchTab){
-      // ── 總覽 Overview: stakeholders/contacts · status · notes(facts) · checklist(work) · unified logs(history) ──
+      // ── 總覽 Overview: stakeholders/contacts · status · notes(facts) · unified logs(history) ──
       const maturityControl = (!isFactory || node.type==="work") ? html`
         <div class="mb14">
           <span class="label">${node.type==="portfolio"?"對象狀態":node.type==="work"?"待辦狀態":"執行階段"}</span>
@@ -1417,27 +1391,6 @@
             <button class="btn btn-secondary" data-act="note-add">＋ 加</button>
           </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
       </div>`;
-
-      // checklist (Work only)
-      let checklistBlock = "";
-      if(node.type==="work"){
-        const cl = node.checklist||[]; const st = checklistStats(node);
-        checklistBlock = html`
-        <div class="card" style="padding:12px 14px;margin-bottom:12px">
-          <div class="flex between aic mb8"><span class="label" style="margin:0">☑ 子任務 ${st.total?`（${st.done}/${st.total}）`:""}</span></div>
-          ${cl.map((c,i)=>`
-            <div class="flex aic gap8" style="margin-bottom:5px">
-              <button class="btn btn-ghost" style="padding:2px 7px" data-act="chk-toggle" data-idx="${i}">${c.done?"☑":"☐"}</button>
-              <span style="flex:1;font-size:12px;${c.done?'color:var(--inkLight);text-decoration:line-through':'color:var(--inkMid)'}">${esc(c.text)}</span>
-              <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="chk-del" data-idx="${i}">×</button>
-            </div>`).join("")}
-          <div class="flex gap6 mt6">
-            <input type="text" data-chk="draft" value="${esc(S.chkDraft||"")}" placeholder="新增一個子任務" style="flex:1">
-            <button class="btn btn-secondary" data-act="chk-add">＋</button>
-          </div>
-          ${node.workStatus==="done"&&st.total&&st.done<st.total?`<div style="margin-top:8px;font-size:11px;color:var(--clay)">⚠ 此待辦已完成，但子任務尚未全部勾選</div>`:""}
-        </div>`;
-      }
 
       // logs = historical events. For a Project, unify all descendant logs here.
       let logSource;
@@ -1494,7 +1447,6 @@
         ${summaryBlock}
         ${stake}
         ${metaRow}
-        ${checklistBlock}
         ${notesBlock}
         ${maturityControl}
         ${logBlock}
@@ -1504,13 +1456,12 @@
       // ── 工項 Branch: overview of all branch(工項)/work(待辦) under this node; edit & move ──
       function row(n, depth){
         const isHi = S.highlightId===n.id;
-        const cl = n.type==="work"?checklistStats(n):null;
         const dd = effDeadline(n);
         return `
         <div class="node-row" style="margin-left:${depth*14}px;border-left:3px solid ${TYPE_CFG[n.type].c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
           <div class="grow tap" data-act="open" data-id="${n.id}">
             <div style="font-size:12px;font-weight:${n.type==="work"?"700":"600"}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
-            <div class="sub">${S.advanced?lbl(n.type):FRIENDLY[n.type]||n.type}${dd?" · "+fmt(dd):""}${cl&&cl.total?` · ☑${cl.done}/${cl.total}`:""}</div>
+            <div class="sub">${S.advanced?lbl(n.type):FRIENDLY[n.type]||n.type}${dd?" · "+fmt(dd):""}</div>
           </div>
           <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px">⇄</button>
         </div>`;
@@ -1972,9 +1923,6 @@
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
         case "note-add": noteAdd(); break;
         case "note-del": noteDel(+t.getAttribute("data-idx")); break;
-        case "chk-add": chkAdd(); break;
-        case "chk-toggle": chkToggle(+t.getAttribute("data-idx")); break;
-        case "chk-del": chkDel(+t.getAttribute("data-idx")); break;
         case "move-cancel": S.moveFor=null; render(); break;
         case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
@@ -1989,13 +1937,8 @@
         case "editlog-cancel": S.editLogId=null; render(); break;
         case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
-        case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); break;
-        case "title-cancel": S.editTitleId=null; render(); break;
-        case "title-save": titleSave(t.getAttribute("data-id")); break;
-        case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "cap-commit": capCommit(); break;
         case "cap-newaccount": capNewAccount(); break;
-        case "cap-finish": { cap.accountId=null; cap.pick=null; cap.title=""; cap.nexts=[]; cap.logText=""; S.view="portfolio"; render(); break; }
         case "cap-pickaccount": cap.accountId=t.getAttribute("data-id"); cap.pick=null; render(); break;
         case "cap-clearaccount": cap.accountId=null; cap.pick=null; cap.title=""; cap.nexts=[]; cap.logText=""; render(); break;
         case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
@@ -2029,9 +1972,7 @@
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; return; }
       if(el.hasAttribute("data-more")){ const k=el.getAttribute("data-more"); if(k==="title")S.moreTitle=el.value; if(k==="dday")S.moreDday=el.value; return; }
       if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
-      if(el.hasAttribute("data-chk")){ S.chkDraft=el.value; return; }
       if(el.hasAttribute("data-editlog")){ const k=el.getAttribute("data-editlog"); if(k==="msg")S.editLogMsg=el.value; if(k==="date")S.editLogDate=el.value; return; }
-      if(el.hasAttribute("data-edittitle")){ S.editTitleDraft=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
@@ -2059,7 +2000,6 @@
       if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value; refreshCapCommit(); }
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; }
       if(el.hasAttribute("data-note")) S.noteDraft=el.value;
-      if(el.hasAttribute("data-chk")) S.chkDraft=el.value;
     });
   }
 
@@ -2102,22 +2042,6 @@
     const target="備註:"+notes[idx];
     updateNode(node.id, n=>{ let removed=false; n.tags=(n.tags||[]).filter(x=>{ if(!removed&&x===target){removed=true;return false;} return true; }); return n; });
     render(); maybeSync("note");
-  }
-  function chkAdd(){
-    const node=byId(S.nodes,S.selectedId); if(!node||node.type!=="work") return;
-    const txt=(S.chkDraft||"").trim(); if(!txt) return;
-    updateNode(node.id, n=>{ n.checklist=(n.checklist||[]).concat({id:uid("chk"),text:txt,done:false}); return n; });
-    S.chkDraft=""; render(); maybeSync("checklist");
-  }
-  function chkToggle(idx){
-    const node=byId(S.nodes,S.selectedId); if(!node) return;
-    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); if(cl[idx]) cl[idx]=Object.assign({},cl[idx],{done:!cl[idx].done}); n.checklist=cl; return n; });
-    render(); maybeSync("checklist");
-  }
-  function chkDel(idx){
-    const node=byId(S.nodes,S.selectedId); if(!node) return;
-    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); cl.splice(idx,1); n.checklist=cl; return n; });
-    render(); maybeSync("checklist");
   }
   function doMove(newParentId){
     const node = byId(S.nodes, S.moveFor); if(!node) return;
@@ -2233,37 +2157,6 @@
     updateNode(fromId, n=>{ n.logs=(n.logs||[]).filter(l=>l.id!==logId); return n; });
     S.editLogId=null; render(); maybeSync("log-del");
   }
-  function titleSave(id){
-    const el=document.querySelector('[data-edittitle="v"]');
-    const v=(el?el.value:S.editTitleDraft||"").trim();
-    if(!v){ S.editTitleId=null; render(); return; }
-    updateNode(id, n=>{ n.title=v; n.lastUpdated=todayStr(); return n; });
-    S.editTitleId=null; render(); maybeSync("rename");
-  }
-  function descendantCount(id){
-    let n=0; (function walk(pid){ childrenOf(S.nodes,pid).forEach(c=>{ n++; walk(c.id); }); })(id);
-    return n;
-  }
-  function nodeDelete(id){
-    const node=byId(S.nodes,id); if(!node) return;
-    const cnt=descendantCount(id);
-    const msg = cnt>0
-      ? `確定刪除「${node.title}」？\n這會一併刪除底下 ${cnt} 個項目，無法復原。`
-      : `確定刪除「${node.title}」？無法復原。`;
-    if(!confirm(msg)) return;
-    // collect id + all descendants
-    const toDel=new Set([id]);
-    (function walk(pid){ childrenOf(S.nodes,pid).forEach(c=>{ toDel.add(c.id); walk(c.id); }); })(id);
-    const parentId = node.parentId;
-    S.nodes = S.nodes.filter(n=>!toDel.has(n.id));
-    // navigate to parent (or Account page)
-    if(parentId && byId(S.nodes,parentId)){ S.selectedId=parentId; S.view="detail"; S.detailTab="branch"; }
-    else { S.view="portfolio"; S.selectedId=null; }
-    S.editTitleId=null;
-    render();
-    toast("已刪除：" + node.title + (cnt>0?`（含 ${cnt} 個子項）`:""));
-    maybeSync("delete");
-  }
   function doTransform(to, freeze){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
     const now = todayStr();
@@ -2346,7 +2239,7 @@
       const made = titles.map((t,i)=>({
         id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary:"",
         workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:cap.dday||null,
-        tags:tags.slice(), checklist:[], metadata:{priority:"normal"},
+        tags:tags.slice(), metadata:{priority:"normal"},
         lastProgress:now, progressSignal:"manual", lastUpdated:now,
         logs:[], attachments: i===0?att:[]
       }));
@@ -2375,13 +2268,9 @@
     }
 
     // reset for next add but KEEP the account selected (keep adding under same account)
-    const createdLabel = p.mode==="work"
-      ? (cap.nexts.length>1 ? `${cap.nexts.length} 筆待辦` : (cap.nexts[0]||cap.title||"待辦"))
-      : (cap.title||(p.mode==="project"?"專案":"工項"));
     cap.pick=null; cap.title=""; cap.nexts=[]; cap.link=""; cap.dday="";
     cap.logText=""; cap.logDate=""; cap.logType="progress"; cap.images=[];
     render();
-    toast("✓ 已建立並歸位："+createdLabel);
     maybeSync("input");
   }
   function handleCapImg(files){
