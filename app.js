@@ -443,6 +443,7 @@
     chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
+    editTitleId:null,  // node id whose title is being inline-edited
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -1337,7 +1338,13 @@
             ${typePill(node.type)}
             ${node.mergeIntoId?pill({c:"var(--inkLight)",bg:"var(--bgMuted)",i:"⤳"},"merged"):""}
           </div>
-          <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
+          ${S.editTitleId===node.id
+            ? `<input type="text" id="title-edit-input" data-act-title="save" value="${esc(node.title)}" style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25;width:100%;border:none;border-bottom:2px solid var(--bamboo);background:transparent;padding:2px 0;outline:none">`
+            : `<div class="flex aic gap6" style="align-items:flex-start">
+                <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25;flex:1">${esc(node.title)}</h2>
+                ${!isFactory?`<button data-act="title-edit" data-id="${node.id}" style="background:none;border:none;font-size:13px;color:var(--inkLight);cursor:pointer;padding:2px 4px;flex-shrink:0;margin-top:1px" title="改名">✎</button>`:""}
+              </div>`
+          }
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
         ${(!isFactory&&node.type==="portfolio")?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">✕ 刪除</button>`:""}
@@ -2010,6 +2017,7 @@
         case "editlog-cancel": S.editLogId=null; render(); break;
         case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
+        case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("title-edit-input"); if(el){el.focus();el.select();} },30); break;
         case "summary-save": summarySave(); break;
         case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "cap-commit": capCommit(); break;
@@ -2064,6 +2072,16 @@
         refreshCapCommit();
       }
     });
+    // title inline edit: Enter = save, Escape = cancel, blur = save
+    root.addEventListener("keydown", e=>{
+      if(e.target.id==="title-edit-input"){
+        if(e.key==="Enter"){ e.preventDefault(); titleSave(S.editTitleId); }
+        if(e.key==="Escape"){ S.editTitleId=null; render(); }
+      }
+    });
+    root.addEventListener("blur", e=>{
+      if(e.target.id==="title-edit-input"){ titleSave(S.editTitleId); }
+    }, true);
     root.onchange = e => {
       const el = e.target;
       if(el.hasAttribute("data-cap-check")){ cap[el.getAttribute("data-cap-check")] = el.checked; render(); return; }
@@ -2230,6 +2248,14 @@
     S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,{summary:txt,lastUpdated:todayStr()}):n);
     render(); maybeSync("summary");
     toast("摘要已儲存");
+  }
+  function titleSave(id){
+    const el = document.getElementById("title-edit-input");
+    const txt = el ? el.value.trim() : "";
+    if(!txt){ S.editTitleId=null; render(); return; }
+    S.nodes = S.nodes.map(n=>n.id===id?Object.assign({},n,{title:txt,lastUpdated:todayStr()}):n);
+    S.editTitleId=null;
+    render(); maybeSync("rename");
   }
   function nodeDelete(id){
     const node = byId(S.nodes, id); if(!node) return;
