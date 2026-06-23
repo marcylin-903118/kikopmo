@@ -440,6 +440,7 @@
     moreFor:null,       // branch id under which 做更多 adds a 待辦
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
+    chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
     // ── Google Sheets sync (via Apps Script Web App) ──
@@ -524,8 +525,12 @@
     if(!m.metadata || typeof m.metadata!=="object") m.metadata = {};
     if(!m.metadata.priority) m.metadata.priority = "normal";
     if(m.metadata.owner==null && m.owner) m.metadata.owner = m.owner;
-    // remove legacy checklist data (work is the atomic unit; checklist field no longer used)
-    if(m.type==="work"){ delete m.checklist; }
+    // checklist only for work
+    if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
+    // portfolio state migration: inbox/frozen → active (B.17.2)
+    if(m.type==="portfolio" && (m.portfolioState==="inbox"||m.portfolioState==="frozen")){
+      m.portfolioState = "active";
+    }
     return m;
   }
   // structured log helpers
@@ -554,6 +559,9 @@
     const n=byId(S.nodes,id); const order=["normal","critical","low"];
     const cur=getPriority(n); const next=order[(order.indexOf(cur)+1)%order.length];
     setPriority(id, next);
+  }
+  function checklistStats(n){
+    const cl=n.checklist||[]; return { done:cl.filter(c=>c.done).length, total:cl.length };
   }
   let _lastNodesJson = "";
   function persist(){
@@ -1213,7 +1221,7 @@
   }
   function viewPortfolio(){
     const ns = S.nodes;
-    const states = ["active","incubator","inbox","frozen","archived"];
+    const states = ["active","incubator"];
     const portfolios = ns.filter(n=>n.type==="portfolio"&&n.portfolioState===S.pfFilter&&!n.mergeIntoId).slice().sort(byBlocked(ns));
     const wip = wipCounts(ns);
     const activeCount = ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="active").length;
@@ -1229,6 +1237,11 @@
       const on=S.pfFilter===s;
       return `<button data-act="pf" data-state="${s}" class="${on?"on":""}" style="${on?`background:${c.c};color:#fff`:`background:${c.bg};color:${c.c}`}">${c.i} ${lblZh(s)} <span style="opacity:.7">${n}</span></button>`;
     }).join("");
+
+    const archivedCount = ns.filter(x=>x.type==="portfolio"&&x.portfolioState==="archived").length;
+    const archivedLink = archivedCount>0
+      ? `<div style="text-align:center;margin-top:16px"><button data-act="pf" data-state="archived" style="background:none;border:none;font-size:11px;color:var(--inkLight);text-decoration:underline;cursor:pointer">查看封存記錄 (${archivedCount})</button></div>`
+      : "";
 
     let body;
     if(portfolios.length===0){
@@ -1280,7 +1293,7 @@
     ${topbar("Account 對象", activeCount+" active")}
     <div class="wip">${wipHtml}</div>
     <div class="chips">${chipsHtml}</div>
-    <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}</div>`;
+    <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}${archivedLink}</div>`;
   }
 
   /* ─── DETAIL ───────────────────────────────────────────────────────────── */
@@ -1292,7 +1305,7 @@
     const isFactory = S.role==="factory";
     const kids = childrenOf(ns, node.id);
 
-    const maturityOpts = node.type==="portfolio" ? ["inbox","incubator","active","frozen","archived"]
+    const maturityOpts = node.type==="portfolio" ? ["active","incubator","archived"]
       : node.type==="work" ? ["todo","doing","done"]
       : ["ready","developing","blocked","complete"];
     const curMaturity = node.portfolioState||node.workStatus||node.executionStage;
@@ -1303,6 +1316,16 @@
       work:[{to:"project",label:"Convert → Project 轉為專案"}],
       portfolio:[{to:"frozen",label:"Freeze 凍結",freeze:true}],
     }[node.type] || [];
+
+    /* portfolio: inline state selector in header */
+    const pfStateBar = node.type==="portfolio" ? html`
+    <div class="flex gap6 wrap" style="margin-bottom:12px">
+      ${maturityOpts.map(s=>{
+        const cfg = PORTFOLIO_CFG[s];
+        const on = (node.portfolioState||"active")===s;
+        return `<button data-act="set-maturity" data-val="${s}" style="padding:5px 11px;border:none;border-radius:99px;font-size:11px;font-weight:600;cursor:pointer;${on?`background:${cfg.c};color:#fff`:`background:${cfg.bg};color:${cfg.c};border:1px solid ${cfg.c}30`}">${cfg.i} ${lblEn(s)}</button>`;
+      }).join("")}
+    </div>` : "";
 
     /* header */
     const header = html`
@@ -1317,13 +1340,15 @@
           <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
+        ${(!isFactory&&node.type==="portfolio")?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">✕ 刪除</button>`:""}
       </div>
+      ${pfStateBar}
       <div class="flex aic gap6 wrap mb14">
-        ${maturityPill(node,true)}${staleBadge(node)}
+        ${node.type!=="portfolio"?maturityPill(node,true):""}${staleBadge(node)}
         <span style="font-size:11px;color:var(--inkLight);margin-left:auto">progress ${fmt(node.lastProgress)} · ${lblEn(node.progressSignal||"manual")}</span>
       </div>
       <div class="tabs">
-        ${[["info","總覽"],["branch","工項"]].map(([id,t])=>`
+        ${[["info","總覽"],["branch","專案樹狀圖"]].map(([id,t])=>`
           <button data-act="tab" data-tab="${id}" class="${(S.detailTab===id||(id==="info"&&S.detailTab!=="branch"))?"on":""}">${t}</button>`).join("")}
       </div>
     </div>`;
@@ -1343,21 +1368,28 @@
     let tabBody = "";
     const onBranchTab = S.detailTab==="branch";
     if(!onBranchTab){
-      // ── 總覽 Overview: stakeholders/contacts · status · notes(facts) · unified logs(history) ──
-      const maturityControl = (!isFactory || node.type==="work") ? html`
+      // ── 總覽 Overview: stakeholders/contacts · status · notes(facts) · checklist(work) · unified logs(history) ──
+      // For portfolio: state selector is in the header, not here
+      const maturityControl = (!isFactory || node.type==="work") && node.type!=="portfolio" ? html`
         <div class="mb14">
-          <span class="label">${node.type==="portfolio"?"對象狀態":node.type==="work"?"待辦狀態":"執行階段"}</span>
+          <span class="label">${node.type==="work"?"待辦狀態":"執行階段"}</span>
           <div class="flex gap6 wrap">
             ${maturityOpts.map(s=>{
-              const cfg = node.type==="portfolio"?PORTFOLIO_CFG[s]:node.type==="work"?WORK_CFG[s]:STAGE_CFG[s];
+              const cfg = node.type==="work"?WORK_CFG[s]:STAGE_CFG[s];
               const on = curMaturity===s;
               return `<button data-act="set-maturity" data-val="${s}" style="padding:5px 11px;border:none;border-radius:99px;font-size:11px;font-weight:600;${on?`background:${cfg.c};color:#fff`:`background:${cfg.bg};color:${cfg.c};border:1px solid ${cfg.c}30`}">${cfg.i} ${lblEn(s)}</button>`;
             }).join("")}
           </div>
         </div>` : "";
 
-      // summary = current state (shown once, at top, not duplicated into notes/logs)
-      const summaryBlock = node.summary ? `<p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary)}</p>` : "";
+      // summary: editable textarea for portfolio; static paragraph for others
+      const summaryBlock = node.type==="portfolio"
+        ? html`<div class="card" style="padding:12px 14px;margin-bottom:14px">
+            <span class="label" style="margin-bottom:6px;display:block">摘要</span>
+            <textarea data-det="summaryDraft" rows="3" placeholder="這個對象目前的方向或狀態…" style="width:100%;box-sizing:border-box">${esc(node.summary||"")}</textarea>
+            <button class="btn btn-secondary sm" data-act="summary-save" style="margin-top:6px">儲存</button>
+          </div>`
+        : (node.summary ? `<p style="font-size:13px;color:var(--inkMid);line-height:1.7;margin-bottom:14px">${esc(node.summary)}</p>` : "");
 
       // stakeholders / contacts (only this from old facts cluster)
       const stake = (node.stakeholders&&node.stakeholders.length)
@@ -1382,7 +1414,7 @@
         <div class="flex between aic mb8"><span class="label" style="margin:0">📌 備註・參考・連結（${notes.length}/5）</span></div>
         ${notes.length? notes.map((nt,i)=>`
           <div class="flex aic gap6" style="margin-bottom:6px">
-            <div style="flex:1;font-size:12px;color:var(--inkMid);line-height:1.5">${linkifyNote(nt)}</div>
+            <div style="flex:1;font-size:12px;font-weight:600;color:var(--inkMid);line-height:1.5">${linkifyNote(nt)}</div>
             <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="note-del" data-idx="${i}">×</button>
           </div>`).join("") : `<div class="muted" style="font-size:11px;margin-bottom:6px">參考資料 / 事實 / 連結放這裡。</div>`}
         ${notes.length<5?`
@@ -1391,6 +1423,27 @@
             <button class="btn btn-secondary" data-act="note-add">＋ 加</button>
           </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
       </div>`;
+
+      // checklist (Work only)
+      let checklistBlock = "";
+      if(node.type==="work"){
+        const cl = node.checklist||[]; const st = checklistStats(node);
+        checklistBlock = html`
+        <div class="card" style="padding:12px 14px;margin-bottom:12px">
+          <div class="flex between aic mb8"><span class="label" style="margin:0">☑ 子任務 ${st.total?`（${st.done}/${st.total}）`:""}</span></div>
+          ${cl.map((c,i)=>`
+            <div class="flex aic gap8" style="margin-bottom:5px">
+              <button class="btn btn-ghost" style="padding:2px 7px" data-act="chk-toggle" data-idx="${i}">${c.done?"☑":"☐"}</button>
+              <span style="flex:1;font-size:12px;${c.done?'color:var(--inkLight);text-decoration:line-through':'color:var(--inkMid)'}">${esc(c.text)}</span>
+              <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="chk-del" data-idx="${i}">×</button>
+            </div>`).join("")}
+          <div class="flex gap6 mt6">
+            <input type="text" data-chk="draft" value="${esc(S.chkDraft||"")}" placeholder="新增一個子任務" style="flex:1">
+            <button class="btn btn-secondary" data-act="chk-add">＋</button>
+          </div>
+          ${node.workStatus==="done"&&st.total&&st.done<st.total?`<div style="margin-top:8px;font-size:11px;color:var(--clay)">⚠ 此待辦已完成，但子任務尚未全部勾選</div>`:""}
+        </div>`;
+      }
 
       // logs = historical events. For a Project, unify all descendant logs here.
       let logSource;
@@ -1445,38 +1498,55 @@
       tabBody = html`
       <div class="up">
         ${summaryBlock}
+        ${maturityControl}
         ${stake}
         ${metaRow}
+        ${checklistBlock}
         ${notesBlock}
-        ${maturityControl}
         ${logBlock}
       </div>`;
     }
     else {
-      // ── 工項 Branch: overview of all branch(工項)/work(待辦) under this node; edit & move ──
+      // ── 專案樹狀圖: all projects/branches/work under this account/node ──
+      const DEPTH_CFG = {
+        project: { icon:"◆", c:"var(--slate)" },
+        branch:  { icon:"❯", c:"var(--bamboo)" },
+        work:    { icon:"▪", c:"var(--clay)" },
+      };
       function row(n, depth){
         const isHi = S.highlightId===n.id;
+        const cl = n.type==="work"?checklistStats(n):null;
         const dd = effDeadline(n);
+        const dc = DEPTH_CFG[n.type]||DEPTH_CFG.work;
+        const indent = depth*18;
+        const connector = depth>0 ? `<span style="position:absolute;left:${indent-10}px;top:0;bottom:0;width:1px;background:var(--bgMuted)"></span>` : "";
         return `
-        <div class="node-row" style="margin-left:${depth*14}px;border-left:3px solid ${TYPE_CFG[n.type].c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
+        <div class="node-row" style="position:relative;margin-left:${indent}px;border-left:3px solid ${dc.c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
+          ${connector}
+          <span style="font-size:11px;color:${dc.c};margin-right:4px;flex-shrink:0">${dc.icon}</span>
           <div class="grow tap" data-act="open" data-id="${n.id}">
-            <div style="font-size:12px;font-weight:${n.type==="work"?"700":"600"}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
-            <div class="sub">${S.advanced?lbl(n.type):FRIENDLY[n.type]||n.type}${dd?" · "+fmt(dd):""}</div>
+            <div style="font-size:12px;font-weight:${n.type==="branch"?"600":"${n.type==='project'?'700':'500'}"}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
+            ${dd||cl&&cl.total?`<div class="sub">${dd?fmt(dd):""}${cl&&cl.total?` ☑${cl.done}/${cl.total}`:""}</div>`:""}
           </div>
           <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px">⇄</button>
         </div>`;
       }
       let listHtml = "";
-      (function walk(id, depth){
+      function walkAll(id, depth){
         childrenOf(S.nodes,id).forEach(c=>{
-          if(c.type==="branch"||c.type==="work"){ listHtml += row(c, depth); walk(c.id, depth+1); }
-          else walk(c.id, depth);
+          if(c.type==="project"||c.type==="branch"||c.type==="work"){
+            listHtml += row(c, depth);
+            walkAll(c.id, depth+1);
+          } else {
+            walkAll(c.id, depth);
+          }
         });
-      })(node.id);
+      }
+      walkAll(node.id, 0);
       tabBody = html`
       <div class="up">
-        <div class="muted" style="font-size:11px;margin-bottom:10px">本${node.type==="project"?"專案":node.type==="portfolio"?"對象":"項目"}底下的工項與待辦。點項目可編輯，⇄ 可搬移。</div>
-        ${listHtml || `<div class="empty">底下還沒有工項/待辦</div>`}
+        <div class="muted" style="font-size:11px;margin-bottom:10px">點項目可編輯，⇄ 可搬移。</div>
+        ${listHtml || `<div class="empty">底下還沒有專案/工項/待辦</div>`}
       </div>`;
     }
 
@@ -1596,7 +1666,7 @@
         lastUpdated: todayStr(),
         logs:[{id:uid("log"),date:todayStr(),signal:"import",content:"Imported 匯入"}], attachments:[] };
       if(r.type==="portfolio"){
-        base.portfolioState = r.portfolioState || "inbox";
+        base.portfolioState = r.portfolioState || "active";
         base.projectMode = r.projectMode || "explore";
         // portfolios don't have a stakeholders field — fold any provided names into tags
         if(r.stakeholders){
@@ -1923,6 +1993,9 @@
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
         case "note-add": noteAdd(); break;
         case "note-del": noteDel(+t.getAttribute("data-idx")); break;
+        case "chk-add": chkAdd(); break;
+        case "chk-toggle": chkToggle(+t.getAttribute("data-idx")); break;
+        case "chk-del": chkDel(+t.getAttribute("data-idx")); break;
         case "move-cancel": S.moveFor=null; render(); break;
         case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
@@ -1937,6 +2010,8 @@
         case "editlog-cancel": S.editLogId=null; render(); break;
         case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
+        case "summary-save": summarySave(); break;
+        case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "cap-commit": capCommit(); break;
         case "cap-newaccount": capNewAccount(); break;
         case "cap-pickaccount": cap.accountId=t.getAttribute("data-id"); cap.pick=null; render(); break;
@@ -1972,6 +2047,7 @@
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; return; }
       if(el.hasAttribute("data-more")){ const k=el.getAttribute("data-more"); if(k==="title")S.moreTitle=el.value; if(k==="dday")S.moreDday=el.value; return; }
       if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
+      if(el.hasAttribute("data-chk")){ S.chkDraft=el.value; return; }
       if(el.hasAttribute("data-editlog")){ const k=el.getAttribute("data-editlog"); if(k==="msg")S.editLogMsg=el.value; if(k==="date")S.editLogDate=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
@@ -2000,6 +2076,7 @@
       if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value; refreshCapCommit(); }
       if(el.hasAttribute("data-det")){ det[el.getAttribute("data-det")] = el.value; }
       if(el.hasAttribute("data-note")) S.noteDraft=el.value;
+      if(el.hasAttribute("data-chk")) S.chkDraft=el.value;
     });
   }
 
@@ -2042,6 +2119,22 @@
     const target="備註:"+notes[idx];
     updateNode(node.id, n=>{ let removed=false; n.tags=(n.tags||[]).filter(x=>{ if(!removed&&x===target){removed=true;return false;} return true; }); return n; });
     render(); maybeSync("note");
+  }
+  function chkAdd(){
+    const node=byId(S.nodes,S.selectedId); if(!node||node.type!=="work") return;
+    const txt=(S.chkDraft||"").trim(); if(!txt) return;
+    updateNode(node.id, n=>{ n.checklist=(n.checklist||[]).concat({id:uid("chk"),text:txt,done:false}); return n; });
+    S.chkDraft=""; render(); maybeSync("checklist");
+  }
+  function chkToggle(idx){
+    const node=byId(S.nodes,S.selectedId); if(!node) return;
+    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); if(cl[idx]) cl[idx]=Object.assign({},cl[idx],{done:!cl[idx].done}); n.checklist=cl; return n; });
+    render(); maybeSync("checklist");
+  }
+  function chkDel(idx){
+    const node=byId(S.nodes,S.selectedId); if(!node) return;
+    updateNode(node.id, n=>{ const cl=(n.checklist||[]).slice(); cl.splice(idx,1); n.checklist=cl; return n; });
+    render(); maybeSync("checklist");
   }
   function doMove(newParentId){
     const node = byId(S.nodes, S.moveFor); if(!node) return;
@@ -2130,6 +2223,29 @@
     S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,upd):n);
     render();
   }
+  function summarySave(){
+    const node = byId(S.nodes, S.selectedId); if(!node) return;
+    const el = document.querySelector('[data-det="summaryDraft"]');
+    const txt = el ? el.value.trim() : (det.summaryDraft||"").trim();
+    S.nodes = S.nodes.map(n=>n.id===node.id?Object.assign({},n,{summary:txt,lastUpdated:todayStr()}):n);
+    render(); maybeSync("summary");
+    toast("摘要已儲存");
+  }
+  function nodeDelete(id){
+    const node = byId(S.nodes, id); if(!node) return;
+    // collect subtree ids
+    const toDelete = new Set();
+    function collect(nid){ toDelete.add(nid); childrenOf(S.nodes,nid).forEach(c=>collect(c.id)); }
+    collect(id);
+    const childCount = toDelete.size - 1;
+    const msg = childCount > 0
+      ? `確定刪除「${node.title}」及底下 ${childCount} 個子項目？此操作無法復原。`
+      : `確定刪除「${node.title}」？此操作無法復原。`;
+    if(!confirm(msg)) return;
+    S.nodes = S.nodes.filter(n=>!toDelete.has(n.id));
+    S.selectedId = null; S.view = "portfolio";
+    render(); maybeSync("delete");
+  }
   function addLog(type){
     const tEl=document.querySelector('[data-det="logText"]'); if(tEl) det.logText=tEl.value;
     if(!det.logText.trim()) { toast("先輸入內容再選類型"); return; }
@@ -2208,7 +2324,7 @@
     const id=uid("pf");
     S.nodes = S.nodes.concat({
       id, type:"portfolio", parentType:null, parentId:null, title:name, summary:"",
-      portfolioState:"inbox", projectMode:cap.newAccountMode||"explore",
+      portfolioState:"active", projectMode:cap.newAccountMode||"explore",
       tags:[], lastProgress:now, progressSignal:"manual", lastUpdated:now,
       logs:[], attachments:[]   // Account holds no log by design
     });
@@ -2239,7 +2355,7 @@
       const made = titles.map((t,i)=>({
         id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary:"",
         workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:cap.dday||null,
-        tags:tags.slice(), metadata:{priority:"normal"},
+        tags:tags.slice(), checklist:[], metadata:{priority:"normal"},
         lastProgress:now, progressSignal:"manual", lastUpdated:now,
         logs:[], attachments: i===0?att:[]
       }));
@@ -2268,8 +2384,14 @@
     }
 
     // reset for next add but KEEP the account selected (keep adding under same account)
+    const committedAccountId = cap.accountId;
     cap.pick=null; cap.title=""; cap.nexts=[]; cap.link=""; cap.dday="";
     cap.logText=""; cap.logDate=""; cap.logType="progress"; cap.images=[];
+    // navigate to the account detail page so user can review/edit what was just created
+    S.selectedId = committedAccountId;
+    S.view = "detail";
+    S.detailTab = "branch";
+    det.showTransform = false;
     render();
     maybeSync("input");
   }
