@@ -1405,7 +1405,13 @@
       const metaRow = showMeta ? html`
       <div class="card" style="padding:11px 13px;margin-bottom:12px">
         <div class="flex aic gap8 wrap" style="font-size:11px">
-          ${effDeadline(node)?`<span style="color:var(--inkMid)">📅 ${fmt(effDeadline(node))}</span>`:`<span class="muted">無交期</span>`}
+          <label style="display:flex;align-items:center;gap:5px;color:var(--inkMid);cursor:pointer">
+            📅
+            <input type="date" data-act-deadline="${node.id}" value="${esc(node.deadline||"")}"
+              style="font-size:11px;border:none;border-bottom:1px solid var(--inkLight);background:transparent;color:var(--inkMid);padding:1px 2px;cursor:pointer;outline:none;width:120px"
+              title="交期 D-DAY">
+            ${node.deadline?`<button data-act="deadline-clear" style="background:none;border:none;font-size:10px;color:var(--inkLight);cursor:pointer;padding:0 2px" title="清除交期">✕</button>`:""}
+          </label>
           ${isPinned(node)?`<span style="color:var(--bamboo)">📌 已釘選</span>`:""}
           ${lk?`<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
         </div>
@@ -1999,6 +2005,7 @@
         case "editlog-cancel": S.editLogId=null; render(); break;
         case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
+        case "deadline-clear": { const node=byId(S.nodes,S.selectedId); if(node){ updateNode(node.id,n=>{n.deadline=null;return n;}); render(); maybeSync("deadline"); } break; }
         case "tree-edit": S.treeEditId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("tree-edit-input"); if(el){el.focus();el.select();} },30); break;
         case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("title-edit-input"); if(el){el.focus();el.select();} },30); break;
         case "summary-save": summarySave(); break;
@@ -2049,6 +2056,13 @@
     // selects fire 'change', not 'input', in some browsers — mirror the handler
     root.addEventListener("change", e => {
       const el = e.target;
+      if(el.hasAttribute("data-act-deadline")){
+        const id = el.getAttribute("data-act-deadline");
+        const val = el.value || null;
+        updateNode(id, n=>{ n.deadline=val; return n; });
+        render(); maybeSync("deadline");
+        return;
+      }
       if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value;
         if(el.getAttribute("data-cap")==="target"){ cap.parentId=""; render(); return; }
         refreshCapCommit();
