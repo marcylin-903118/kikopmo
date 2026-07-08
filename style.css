@@ -187,6 +187,8 @@ pre.md{background:var(--bg);border-radius:var(--rsm);padding:12px;font-size:11px
 .empty{text-align:center;color:var(--inkLight);font-size:12px;padding:28px 0;}
 .spacer{height:14px;}
 .flex{display:flex;}
+.gap4{gap:4px;}
+.gap5{gap:5px;}
 .gap6{gap:6px;}
 .gap8{gap:8px;}
 .between{justify-content:space-between;}
