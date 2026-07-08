@@ -2164,12 +2164,17 @@
   function wMore(id){
     const node = byId(S.nodes, id);
     // target 工項 = the branch this work belongs to; if the card itself is a branch, use it
+    // project cards cannot directly add work (need a branch first) → open detail instead
     let branchId = null;
     if(node){
       if(node.type==="work") branchId = node.parentId;
       else if(node.type==="branch") branchId = node.id;
-      else branchId = node.parentId;
+      else if(node.type==="project"){
+        // redirect to project detail so user can add a branch first
+        S.selectedId = node.id; S.view = "detail"; render(); return;
+      } else branchId = null; // shouldn't happen
     }
+    if(!branchId){ return; }
     S.moreFor = branchId;
     S.moreTitle = ""; S.moreDday = "";
     render();
@@ -2397,6 +2402,22 @@
 
   /* ─── boot ─────────────────────────────────────────────────────────────── */
   load();
+  // Repair hierarchy violations: work nodes whose parent is not a branch get flagged.
+  // This fixes nodes created by the wMore bug (work parented to portfolio/project).
+  (function repairHierarchy(){
+    if(!S.nodes) return;
+    const byIdMap = new Map(S.nodes.map(n=>[n.id,n]));
+    S.nodes = S.nodes.map(n=>{
+      if(n.type!=="work") return n;
+      const parent = byIdMap.get(n.parentId);
+      if(parent && parent.type!=="branch"){
+        // wrong parent: detach by clearing parentId so it surfaces visibly
+        return Object.assign({}, n, { parentId:null, parentType:null,
+          tags:(n.tags||[]).concat("⚠階層修復") });
+      }
+      return n;
+    });
+  })();
   // Prevent migration/load from marking data dirty (which could auto-push stale data
   // over a newer cloud copy). Baseline the snapshot to the just-loaded state.
   try { _lastNodesJson = JSON.stringify(S.nodes||[]); } catch(e){}
