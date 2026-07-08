@@ -527,6 +527,11 @@
     if(m.metadata.owner==null && m.owner) m.metadata.owner = m.owner;
     // checklist only for work
     if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
+    // portfolioState: collapse inbox/frozen → active (states simplified to active|incubator|archived)
+    if(m.type==="portfolio"){
+      if(!m.portfolioState || m.portfolioState==="inbox" || m.portfolioState==="frozen")
+        m.portfolioState = "active";
+    }
     return m;
   }
   // structured log helpers
@@ -1232,7 +1237,7 @@
   }
   function viewPortfolio(){
     const ns = S.nodes;
-    const states = ["active","incubator","inbox","frozen","archived"];
+    const states = ["active","incubator","archived"];
     const portfolios = ns.filter(n=>n.type==="portfolio"&&n.portfolioState===S.pfFilter&&!n.mergeIntoId).slice().sort(byBlocked(ns));
     const wip = wipCounts(ns);
     const activeCount = ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="active").length;
@@ -1311,7 +1316,7 @@
     const isFactory = S.role==="factory";
     const kids = childrenOf(ns, node.id);
 
-    const maturityOpts = node.type==="portfolio" ? ["inbox","incubator","active","frozen","archived"]
+    const maturityOpts = node.type==="portfolio" ? ["active","incubator","archived"]
       : node.type==="work" ? ["todo","doing","done"]
       : ["ready","developing","blocked","complete"];
     const curMaturity = node.portfolioState||node.workStatus||node.executionStage;
@@ -1320,7 +1325,7 @@
       project:[{to:"branch",label:"轉為工項 → Branch"}],
       branch:[{to:"work",label:"轉為待辦 → Work"}],
       work:[{to:"project",label:"Convert → Project 轉為專案"}],
-      portfolio:[{to:"frozen",label:"Freeze 凍結",freeze:true}],
+      portfolio:[],
     }[node.type] || [];
 
     /* header */
@@ -1638,7 +1643,7 @@
         lastUpdated: todayStr(),
         logs:[{id:uid("log"),date:todayStr(),signal:"import",content:"Imported 匯入"}], attachments:[] };
       if(r.type==="portfolio"){
-        base.portfolioState = r.portfolioState || "inbox";
+        base.portfolioState = r.portfolioState || "active";
         base.projectMode = r.projectMode || "explore";
         // portfolios don't have a stakeholders field — fold any provided names into tags
         if(r.stakeholders){
@@ -1834,7 +1839,7 @@
   function buildSnapshot(ns){
     return {
       active: ns.filter(n=>n.type==="work"&&n.workStatus!=="done"&&!n.mergeIntoId),
-      inbox: ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="inbox"),
+      incubating: ns.filter(n=>n.type==="portfolio"&&n.portfolioState==="incubator"),
       blocked: ns.filter(n=>(n.type==="project"||n.type==="branch")&&n.executionStage==="blocked"&&!n.mergeIntoId),
       stale: ns.filter(isStale),
       portfolios: ns.filter(n=>n.type==="portfolio"&&!n.mergeIntoId),
@@ -1847,7 +1852,7 @@
     return [
       `# Kikō PMO Snapshot — ${todayStr()}`, "",
       sec("Today's Active (work items)", s.active), "",
-      sec("Inbox", s.inbox), "",
+      sec("Incubating", s.incubating), "",
       sec("Blocked", s.blocked), "",
       sec("Stale > 7d", s.stale), "",
       "## Suggested Merge", "- (review captures with ≥2 shared signals)", "",
@@ -1886,7 +1891,7 @@
     const wb = XLSX.utils.book_new();
     const sheet = (arr,cols)=>XLSX.utils.json_to_sheet(arr.length?arr.map(cols):[{}]);
     XLSX.utils.book_append_sheet(wb, sheet(s.active, n=>({Title:n.title,Owner:n.owner||"",Status:n.workStatus,Deadline:n.deadline||""})), "Today Active");
-    XLSX.utils.book_append_sheet(wb, sheet(s.inbox, n=>({Title:n.title,Mode:n.projectMode})), "Inbox");
+    XLSX.utils.book_append_sheet(wb, sheet(s.incubating, n=>({Title:n.title,Mode:n.projectMode})), "Incubating");
     XLSX.utils.book_append_sheet(wb, sheet(s.blocked, n=>({Title:n.title,Stage:n.executionStage})), "Blocked");
     XLSX.utils.book_append_sheet(wb, sheet(s.stale, n=>({Title:n.title,IdleDays:daysSince(n.lastProgress)})), "Stale");
     XLSX.utils.book_append_sheet(wb, sheet(s.portfolios, n=>({Title:n.title,State:n.portfolioState,Mode:n.projectMode})), "Portfolio");
@@ -2271,7 +2276,7 @@
     const id=uid("pf");
     S.nodes = S.nodes.concat({
       id, type:"portfolio", parentType:null, parentId:null, title:name, summary:"",
-      portfolioState:"inbox", projectMode:cap.newAccountMode||"explore",
+      portfolioState:"active", projectMode:cap.newAccountMode||"explore",
       tags:[], lastProgress:now, progressSignal:"manual", lastUpdated:now,
       logs:[], attachments:[]   // Account holds no log by design
     });
