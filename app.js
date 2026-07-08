@@ -443,7 +443,6 @@
     chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
-    editTitleId:null,   // node whose title is being edited
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -509,7 +508,7 @@
     try { const u=localStorage.getItem(LS_SYNC_URL); if(u) S.syncUrl=u; } catch(e){}
     try { const d=localStorage.getItem(LS_DEVICE); if(d) S.syncDevice=d; } catch(e){}
     try { const m=localStorage.getItem(LS_SYNC_META); if(m) S.syncMeta=JSON.parse(m); } catch(e){}
-    if(S.nodes){ S.nodes = S.nodes.map(migrateNode); S.nodes = repairHierarchy(S.nodes); }
+    if(S.nodes) S.nodes = S.nodes.map(migrateNode);
   }
   // ── migration: upgrade logs to structured objects; lazily ready metadata/checklist ──
   // Never regenerate IDs. Never break imports. Backward compatible.
@@ -529,42 +528,6 @@
     // checklist only for work
     if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
     return m;
-  }
-  // Heal illegal parenting created by earlier bugs: a Work must live under a Branch.
-  // If a Work's parent is a Project (or Account), wrap it in a default Branch under that
-  // Project so the hierarchy is legal and the branch/tree views can find it.
-  function repairHierarchy(nodes){
-    const byIdLocal = id => nodes.find(n=>n.id===id);
-    const uidLocal = p => (p||"id")+"_"+Math.random().toString(36).slice(2,9);
-    let changed=false;
-    // ensure a default branch per project that has orphan works, reuse across the project
-    const defaultBranchForProject = {};
-    nodes.forEach(n=>{
-      if(n.type!=="work") return;
-      const parent = byIdLocal(n.parentId);
-      if(parent && parent.type==="branch") return; // already legal
-      // find the intended project: if parent is a project use it; if parent is account, skip (can't guess project)
-      let project=null;
-      if(parent && parent.type==="project") project=parent;
-      else if(parent && parent.type==="portfolio") project=null; // work directly under account — needs a project; leave to user
-      if(!project) return;
-      let br;
-      if(defaultBranchForProject[project.id]){ br=defaultBranchForProject[project.id]; }
-      else {
-        const existing = nodes.find(x=>x.type==="branch" && x.parentId===project.id && !x.mergeIntoId);
-        if(existing){ br=existing; }
-        else {
-          br={ id:uidLocal("br"), type:"branch", parentType:"project", parentId:project.id,
-            title:"待辦", summary:"", executionStage:"ready", channel:"", firstSuccessEvent:"",
-            deadline:null, tags:[], metadata:{priority:"normal"},
-            lastProgress:todayStr(), progressSignal:"manual", lastUpdated:todayStr(), logs:[], attachments:[] };
-          nodes.push(br); changed=true;
-        }
-        defaultBranchForProject[project.id]=br;
-      }
-      n.parentId=br.id; n.parentType="branch"; changed=true;
-    });
-    return nodes;
   }
   // structured log helpers
   function mkLog(type, message){ return { id:uid("log"), date:todayStr(), type:type||"note", message:message||"" }; }
@@ -836,22 +799,12 @@
 
     // 1) in-progress leaf work
     const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId && notArchived(n));
-    // 2) loose threads: a project/branch that is itself not complete AND has NO incomplete
-    //    child (branch/work) underneath → show it so the thread isn't dropped, regardless of
-    //    D-DAY. Gains an incomplete child → disappears. All children complete → it returns.
-    //    Marking itself 完成 (complete) removes it. Account never shows.
-    function hasIncompleteChild(n){
-      return childrenOf(ns,n.id).some(c=>{
-        if(c.mergeIntoId) return false;
-        if(c.type==="work") return c.workStatus!=="done";
-        if(c.type==="branch"||c.type==="project") return c.executionStage!=="complete" || hasIncompleteChild(c);
-        return false;
-      });
-    }
-    const looseThreads = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
+    // 2) branch/project that have a D-DAY but NO child work (so Daily wouldn't otherwise show them)
+    const leafDated = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
       && n.executionStage!=="complete"
-      && !hasIncompleteChild(n));
-    const items = works.concat(looseThreads);
+      && effDeadline(n)
+      && !childrenOf(ns,n.id).some(c=>c.type==="work"));
+    const items = works.concat(leafDated);
 
     const sorted = items.slice().sort((a,b)=>{
       const pa=isPinned(a)?0:1, pb=isPinned(b)?0:1;     // pin first
@@ -881,28 +834,13 @@
     if(sorted.length===0){
       body = `<div class="empty">目前沒有進行中的工作 🎉<br><span style="font-size:11px">No work in progress.</span></div>`;
     } else {
-      groupKeys.forEach(gid=>{
-        const root = gid==="_"?null:byId(ns,gid);
-        const head = root
-          ? `<div class="flex aic gap8" style="margin:14px 2px 8px">
-               <span style="font-size:12px;font-weight:700;color:var(--moss)">${S.advanced?"":(codes[root.id]+" ")}${esc(root.title)}</span>
-               ${S.advanced?`<span class="tag">${lbl("portfolio")}</span>`:""}
-             </div>`
-          : "";
-        body += head + groups[gid].map(w=>workCardHtml(w, codes, ns)).join("");
-      });
+      body = sorted.map(w=>workCardHtml(w, codes, ns)).join("");
     }
 
     return html`
     ${topbar("Daily 今日進行", fmt(todayStr()), right)}
     ${syncBar()}
     <div class="pad">
-      <div class="muted" style="font-size:11px;margin-bottom:8px">
-        所有未完成的待辦都在這裡，依交期排序（無交期者以建立日+7天估算；釘選同級才優先）。
-      </div>
-      <div class="flex gap6 wrap mb14" style="font-size:10px;color:var(--inkLight)">
-        <span>✅ 完成</span><span>⏸ 延後</span><span>➕ 做更多</span>
-      </div>
       ${body}
     </div>`;
   }
@@ -941,40 +879,70 @@
     return null;
   }
 
-  // a single Daily card: work OR dated leaf branch/project. 3 buttons + pin.
+  // a single Daily card: work OR dated leaf branch/project.
+  // Left border encodes node type; account tag + pin + 3 icon buttons in top-right corner.
   function workCardHtml(w, codes, ns){
     ns = ns || S.nodes;
     const isWork = w.type==="work";
+    const isBranch = w.type==="branch";
+    const isProject = w.type==="project";
     const dd = effDeadline(w);
     const noDd = !dd;
     const implied = noDd ? new Date(sortDeadline(w)) : null;
     const overdue = dd && new Date(dd) < Date.now();
-    const stale = isStale(w);
     const pinned = isPinned(w);
-    const ctx = projectBranchContext(w, ns);
-    const typeTag = !isWork ? `<span class="tag" style="background:var(--bambooBg);color:var(--bamboo)">${w.type==="branch"?"工項":"專案"}・待拆待辦</span>` : "";
     const lk = getLink(w);
+
+    // left border: work=bamboo(pinned override), branch=slate, project=clay
+    let borderColor = "var(--bgMuted)";
+    if(pinned)         borderColor = "var(--bamboo)";
+    else if(isWork)    borderColor = "var(--bgMuted)";
+    else if(isBranch)  borderColor = "var(--slate)";
+    else if(isProject) borderColor = "var(--clay)";
+
+    // breadcrumb context line: Project › Branch (for work nodes)
+    // for branch nodes: Project only; for project nodes: nothing
+    let ctx = "";
+    if(isWork)    ctx = projectBranchContext(w, ns);
+    else if(isBranch){ let p=byId(ns,w.parentId); ctx = p?`<span style="font-weight:600">【${esc(p.title)}】</span>`:""; }
+
+    // account tag (top-right)
+    const root = rootPortfolio(ns, w);
+    const accountTag = root
+      ? `<span class="tag" style="background:var(--mossBg);color:var(--moss);font-size:9px;white-space:nowrap">${esc(root.title)}</span>`
+      : "";
+
+    // node type badge for un-decomposed branch/project
+    const typeBadge = !isWork
+      ? `<span style="font-size:9px;color:var(--inkLight);background:var(--bgMuted);border-radius:3px;padding:1px 4px">${isBranch?"工項":"專案"}・待拆</span>`
+      : "";
+
     return html`
-    <div class="card" style="padding:13px 14px;margin-bottom:8px;${pinned?'border-left:3px solid var(--bamboo)':''}">
-      <div class="flex between aic" style="gap:8px">
-        <div class="grow tap" data-act="open-from-daily" data-id="${w.id}">
-          ${ctx?`<div style="font-size:10px;color:var(--inkLight);margin-bottom:3px">${ctx}</div>`:""}
-          <div class="flex aic gap6" style="margin-bottom:2px">
-            <span style="font-size:15px;font-weight:700">${esc(w.title)}</span>
-            ${typeTag}
-          </div>
-          <div class="flex aic gap6 wrap" style="font-size:10px;color:var(--inkLight)">
-            ${dd?`<span style="color:${overdue?'var(--clay)':'var(--inkLight)'}">D-DAY ${fmt(dd)}${overdue?' ⚠':''}</span>`
-                :`<span title="無交期，以建立日+7天估算">交期未定（約 ${fmt(implied.toISOString().slice(0,10))}）</span>`}
-            ${lk?`<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate);text-decoration:underline">🔗 連結</a>`:""}
-          </div>
+    <div class="card daily-card" style="padding:10px 12px;margin-bottom:6px;border-left:3px solid ${borderColor}">
+      <!-- top row: context + account tag + action buttons -->
+      <div class="flex between aic" style="gap:6px;margin-bottom:4px">
+        <div class="grow" style="min-width:0">
+          ${ctx?`<div style="font-size:9px;color:var(--inkLight);line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${ctx}</div>`:""}
         </div>
-        <button class="btn btn-ghost sm" data-act="pin" data-id="${w.id}" title="釘選" style="padding:4px 8px">${pinned?"📌":"📍"}</button>
+        <div class="flex aic gap4" style="flex-shrink:0">
+          ${accountTag}
+          <button class="daily-btn" data-act="w-done"  data-id="${w.id}" title="完成">✓</button>
+          <button class="daily-btn" data-act="w-delay" data-id="${w.id}" title="延後">⏸</button>
+          <button class="daily-btn" data-act="w-more"  data-id="${w.id}" title="做更多">＋</button>
+          <button class="daily-btn ${pinned?'daily-btn-active':''}" data-act="pin" data-id="${w.id}" title="釘選">📍</button>
+        </div>
       </div>
-      <div class="flex gap6 mt10">
-        <button class="btn sm" style="flex:1;background:var(--mossBg);color:var(--moss)" data-act="w-done" data-id="${w.id}">✅ 完成</button>
-        <button class="btn sm" style="flex:1;background:var(--bgMuted);color:var(--inkMid)" data-act="w-delay" data-id="${w.id}">⏸ 延後</button>
-        <button class="btn sm" style="flex:1;background:var(--bambooBg);color:var(--bamboo)" data-act="w-more" data-id="${w.id}">➕ 做更多</button>
+      <!-- main content: tap to open -->
+      <div class="tap" data-act="open-from-daily" data-id="${w.id}">
+        <div class="flex aic gap5 wrap" style="margin-bottom:3px">
+          <span style="font-size:14px;font-weight:700;line-height:1.3">${esc(w.title)}</span>
+          ${typeBadge}
+        </div>
+        <div style="font-size:10px;color:${overdue?'var(--clay)':'var(--inkLight)'}">
+          ${dd?`D-DAY ${fmt(dd)}${overdue?' ⚠':''}`
+              :`交期未定（約 ${fmt(implied.toISOString().slice(0,10))}）`}
+          ${lk?`&ensp;<a class="wlink" href="${esc(lk)}" target="_blank" rel="noopener" style="color:var(--slate)">🔗</a>`:""}
+        </div>
       </div>
     </div>`;
   }
@@ -1181,8 +1149,7 @@
       ${pick?logBlock:""}
 
       <button class="btn btn-primary full mt14" data-act="cap-commit">建立並歸位</button>
-      <div class="center muted" style="font-size:10px;margin-top:8px">先點上面的 ➕ 選位置並填名稱，再按這裡。可連續建多筆。</div>
-      <button class="btn btn-secondary full mt10" data-act="cap-finish">✓ 完成，回對象頁</button>
+      <div class="center muted" style="font-size:10px;margin-top:8px">先點上面的 ➕ 選位置並填名稱，再按這裡。由你確認，不自動建立。</div>
     </div>`;
   }
 
@@ -1357,7 +1324,6 @@
     }[node.type] || [];
 
     /* header */
-    const editingTitle = S.editTitleId===node.id;
     const header = html`
     <div class="detail-head">
       <div class="flex aic gap8 mb10" style="align-items:flex-start">
@@ -1367,21 +1333,12 @@
             ${typePill(node.type)}
             ${node.mergeIntoId?pill({c:"var(--inkLight)",bg:"var(--bgMuted)",i:"⤳"},"merged"):""}
           </div>
-          ${editingTitle
-            ? `<div class="flex gap6 aic">
-                 <input type="text" data-edittitle="v" value="${esc(node.title)}" style="flex:1;font-size:16px">
-                 <button class="btn btn-primary sm" data-act="title-save" data-id="${node.id}">存</button>
-                 <button class="btn btn-ghost sm" data-act="title-cancel">取消</button>
-               </div>`
-            : `<h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}
-                 <button class="btn btn-ghost" style="padding:1px 7px;font-size:12px;vertical-align:middle" data-act="title-edit" data-id="${node.id}">✎</button>
-               </h2>`}
+          <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
         ${maturityPill(node,true)}${staleBadge(node)}
-        ${!isFactory?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">🗑 刪除</button>`:""}
         <span style="font-size:11px;color:var(--inkLight);margin-left:auto">progress ${fmt(node.lastProgress)} · ${lblEn(node.progressSignal||"manual")}</span>
       </div>
       <div class="tabs">
@@ -2025,13 +1982,8 @@
         case "editlog-cancel": S.editLogId=null; render(); break;
         case "editlog-save": editLogSave(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
         case "editlog-del": editLogDel(t.getAttribute("data-id"), t.getAttribute("data-from")); break;
-        case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); break;
-        case "title-cancel": S.editTitleId=null; render(); break;
-        case "title-save": titleSave(t.getAttribute("data-id")); break;
-        case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "cap-commit": capCommit(); break;
         case "cap-newaccount": capNewAccount(); break;
-        case "cap-finish": { cap.accountId=null; cap.pick=null; cap.title=""; cap.nexts=[]; cap.logText=""; S.view="portfolio"; render(); break; }
         case "cap-pickaccount": cap.accountId=t.getAttribute("data-id"); cap.pick=null; render(); break;
         case "cap-clearaccount": cap.accountId=null; cap.pick=null; cap.title=""; cap.nexts=[]; cap.logText=""; render(); break;
         case "cap-rmimg": { const i=+t.getAttribute("data-idx"); cap.images.splice(i,1); render(); break; }
@@ -2067,7 +2019,6 @@
       if(el.hasAttribute("data-note")){ S.noteDraft=el.value; return; }
       if(el.hasAttribute("data-chk")){ S.chkDraft=el.value; return; }
       if(el.hasAttribute("data-editlog")){ const k=el.getAttribute("data-editlog"); if(k==="msg")S.editLogMsg=el.value; if(k==="date")S.editLogDate=el.value; return; }
-      if(el.hasAttribute("data-edittitle")){ S.editTitleDraft=el.value; return; }
       if(el.hasAttribute("data-set")){ const k=el.getAttribute("data-set"); if(k==="url")S.settingsUrlDraft=el.value; if(k==="dev")S.settingsDevDraft=el.value; return; }
       if(el.hasAttribute("data-imp")){ S.importRaw = el.value;
         const btn = root.querySelector('[data-act="import-compute"]');
@@ -2207,32 +2158,12 @@
   // ➕ 做更多 — open simple popup to add ONE new 待辦 under the SAME 工項 (parent branch)
   function wMore(id){
     const node = byId(S.nodes, id);
-    if(!node){ return; }
-    // Resolve the target Branch that will hold the new Work (Work always lives under a Branch).
-    // - card is Work    → its parent Branch
-    // - card is Branch  → itself
-    // - card is Project → a Branch under it (first existing, else create a default one)
-    // - card is Account → not allowed (must go through a Project first)
+    // target 工項 = the branch this work belongs to; if the card itself is a branch, use it
     let branchId = null;
-    if(node.type==="work"){ branchId = node.parentId; }
-    else if(node.type==="branch"){ branchId = node.id; }
-    else if(node.type==="project"){
-      const existing = childrenOf(S.nodes, node.id).find(c=>c.type==="branch" && !c.mergeIntoId);
-      if(existing){ branchId = existing.id; }
-      else {
-        // auto-create a default Branch under this Project so the Work has a legal home
-        const now=todayStr();
-        const b={ id:uid("br"), type:"branch", parentType:"project", parentId:node.id,
-          title:"待辦", summary:"", executionStage:"ready", channel:"", firstSuccessEvent:"",
-          deadline:null, tags:[], metadata:{priority:"normal"},
-          lastProgress:now, progressSignal:"manual", lastUpdated:now, logs:[], attachments:[] };
-        S.nodes = S.nodes.concat(b);
-        branchId = b.id;
-      }
-    } else {
-      // Account — 做更多 doesn't apply directly; guide the user
-      toast("請先在對象底下建立專案，再新增待辦");
-      return;
+    if(node){
+      if(node.type==="work") branchId = node.parentId;
+      else if(node.type==="branch") branchId = node.id;
+      else branchId = node.parentId;
     }
     S.moreFor = branchId;
     S.moreTitle = ""; S.moreDday = "";
@@ -2288,37 +2219,6 @@
   function editLogDel(logId, fromId){
     updateNode(fromId, n=>{ n.logs=(n.logs||[]).filter(l=>l.id!==logId); return n; });
     S.editLogId=null; render(); maybeSync("log-del");
-  }
-  function titleSave(id){
-    const el=document.querySelector('[data-edittitle="v"]');
-    const v=(el?el.value:S.editTitleDraft||"").trim();
-    if(!v){ S.editTitleId=null; render(); return; }
-    updateNode(id, n=>{ n.title=v; n.lastUpdated=todayStr(); return n; });
-    S.editTitleId=null; render(); maybeSync("rename");
-  }
-  function descendantCount(id){
-    let n=0; (function walk(pid){ childrenOf(S.nodes,pid).forEach(c=>{ n++; walk(c.id); }); })(id);
-    return n;
-  }
-  function nodeDelete(id){
-    const node=byId(S.nodes,id); if(!node) return;
-    const cnt=descendantCount(id);
-    const msg = cnt>0
-      ? `確定刪除「${node.title}」？\n這會一併刪除底下 ${cnt} 個項目，無法復原。`
-      : `確定刪除「${node.title}」？無法復原。`;
-    if(!confirm(msg)) return;
-    // collect id + all descendants
-    const toDel=new Set([id]);
-    (function walk(pid){ childrenOf(S.nodes,pid).forEach(c=>{ toDel.add(c.id); walk(c.id); }); })(id);
-    const parentId = node.parentId;
-    S.nodes = S.nodes.filter(n=>!toDel.has(n.id));
-    // navigate to parent (or Account page)
-    if(parentId && byId(S.nodes,parentId)){ S.selectedId=parentId; S.view="detail"; S.detailTab="branch"; }
-    else { S.view="portfolio"; S.selectedId=null; }
-    S.editTitleId=null;
-    render();
-    toast("已刪除：" + node.title + (cnt>0?`（含 ${cnt} 個子項）`:""));
-    maybeSync("delete");
   }
   function doTransform(to, freeze){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
@@ -2431,13 +2331,9 @@
     }
 
     // reset for next add but KEEP the account selected (keep adding under same account)
-    const createdLabel = p.mode==="work"
-      ? (cap.nexts.length>1 ? `${cap.nexts.length} 筆待辦` : (cap.nexts[0]||cap.title||"待辦"))
-      : (cap.title||(p.mode==="project"?"專案":"工項"));
     cap.pick=null; cap.title=""; cap.nexts=[]; cap.link=""; cap.dday="";
     cap.logText=""; cap.logDate=""; cap.logType="progress"; cap.images=[];
     render();
-    toast("✓ 已建立並歸位："+createdLabel);
     maybeSync("input");
   }
   function handleCapImg(files){
@@ -2470,6 +2366,29 @@
       render();
     } catch(err){ alert("Could not read file: "+err.message); }
   }
+
+  /* ─── inject daily-btn styles ──────────────────────────────────────────── */
+  (function injectDailyStyles(){
+    if(document.getElementById("kiko-daily-styles")) return;
+    const el = document.createElement("style");
+    el.id = "kiko-daily-styles";
+    el.textContent = `
+      .daily-btn {
+        display:inline-flex;align-items:center;justify-content:center;
+        width:28px;height:28px;border-radius:6px;border:none;
+        background:var(--bgMuted,#ede9e3);color:var(--inkMid,#7a6f63);
+        font-size:13px;cursor:pointer;padding:0;flex-shrink:0;
+        transition:background .15s,color .15s;
+      }
+      .daily-btn:active { background:var(--border,#d5cec6); }
+      .daily-btn-active { color:var(--bamboo,#b07d3a); }
+      .daily-card { transition:box-shadow .15s; }
+      .daily-card:active { box-shadow:0 0 0 2px var(--border,#d5cec6); }
+      .gap4 { gap:4px; }
+      .gap5 { gap:5px; }
+    `;
+    document.head.appendChild(el);
+  })();
 
   /* ─── boot ─────────────────────────────────────────────────────────────── */
   load();
