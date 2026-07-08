@@ -804,11 +804,17 @@
 
     // 1) in-progress leaf work
     const works = ns.filter(n=>n.type==="work" && n.workStatus!=="done" && !n.mergeIntoId && notArchived(n));
-    // 2) branch/project that have a D-DAY but NO child work (so Daily wouldn't otherwise show them)
+    // 2) branch/project with D-DAY that have NO incomplete work anywhere beneath them
+    // collect all descendant ids for a node, then check for incomplete work among them
+    function descendantIds(nodeId){
+      const result=new Set(); const queue=[nodeId];
+      while(queue.length){ const cur=queue.shift(); ns.forEach(n=>{ if(n.parentId===cur){ result.add(n.id); queue.push(n.id); } }); }
+      return result;
+    }
     const leafDated = ns.filter(n=>(n.type==="branch"||n.type==="project") && !n.mergeIntoId && notArchived(n)
       && n.executionStage!=="complete"
       && effDeadline(n)
-      && !childrenOf(ns,n.id).some(c=>c.type==="work"));
+      && !ns.some(w=>w.type==="work" && w.workStatus!=="done" && !w.mergeIntoId && descendantIds(n.id).has(w.id)));
     const items = works.concat(leafDated);
 
     const sorted = items.slice().sort((a,b)=>{
