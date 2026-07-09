@@ -384,6 +384,11 @@
 
   const childrenOf = (ns,id) => ns.filter(n=>n.parentId===id && !n.mergeIntoId);
   const byId = (ns,id) => ns.find(n=>n.id===id);
+  function collectSubtreeIds(ns, id){
+    let ids=[id];
+    childrenOf(ns,id).forEach(c=>{ ids = ids.concat(collectSubtreeIds(ns,c.id)); });
+    return ids;
+  }
   const isStale = n => {
     if (["portfolio","capture"].includes(n.type)) return false;
     if (n.executionStage==="complete"||n.workStatus==="done") return false;
@@ -453,6 +458,7 @@
     dirty:false,        // unsynced local changes exist
     settingsUrlDraft:"",// settings page input buffer
     settingsDevDraft:"",
+    healthIssues:null,  // null=not scanned yet; [] = scanned, none found; [...] = found issues
   };
 
   // ── tag-encoded metadata (schema unchanged: stored as special tags) ──────────
@@ -682,7 +688,8 @@
   function html(strings, ...vals){ return strings.reduce((a,s,i)=>a+s+(vals[i]!=null?vals[i]:""),""); }
 
   function pill(cfg, text, md){
-    return `<span class="pill ${md?'md':''}" style="background:${cfg.bg};color:${cfg.c};border:1px solid ${cfg.c}28">${cfg.i} ${esc(text)}</span>`;
+    const c = cfg || { bg:"var(--bgMuted)", c:"var(--inkLight)", i:"⚠" };
+    return `<span class="pill ${md?'md':''}" style="background:${c.bg};color:${c.c};border:1px solid ${c.c}28">${c.i} ${esc(text)}</span>`;
   }
   function typePill(t,md){ return pill(TYPE_CFG[t], lblEn(t), md); }
   function maturityPill(n,md){
@@ -986,15 +993,15 @@
     </div>`;
   }
 
-  // 移動到… modal: pick a new parent of the correct type
+  // 移動到… modal: pick ANY new parent (portfolio/project/branch) — the node auto-
+  // converts to whatever type belongs one level under the chosen parent, so mis-leveled
+  // entries can be fixed directly instead of only reshuffling within the same level.
   function moveModalHtml(){
     const ns = S.nodes;
     const node = byId(ns, S.moveFor);
     if(!node) return "";
     const codes = buildCodes(ns);
-    // valid new parents by child type
-    const parentType = { work:"branch", branch:"project", project:"portfolio" }[node.type];
-    if(!parentType){ // portfolio can't be re-parented
+    if(node.type==="portfolio"){ // portfolio is always root — never re-parented
       return `<div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
         <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px">
           <div class="flex between aic mb10"><div style="font-family:'Lora',serif;font-size:16px">搬移</div><button class="back" data-act="move-cancel">×</button></div>
@@ -1002,25 +1009,35 @@
           <button class="btn btn-ghost full mt14" data-act="move-cancel">關閉</button>
         </div></div>`;
     }
-    const candidates = ns.filter(n=>n.type===parentType && !n.mergeIntoId && n.id!==node.parentId);
-    const word = { branch:"工項", project:"專案", portfolio:"對象" }[parentType];
-    const rows = candidates.length
-      ? candidates.map(c=>`<button class="btn btn-secondary full mb6" style="justify-content:flex-start" data-act="move-to" data-pid="${c.id}">
+    const excluded = new Set(collectSubtreeIds(ns, node.id)); // can't move into self or own descendants
+    const candidates = ns.filter(n=>
+      (n.type==="portfolio"||n.type==="project"||n.type==="branch") &&
+      !n.mergeIntoId && !excluded.has(n.id) && n.id!==node.parentId
+    );
+    const childTypeOf = { portfolio:"project", project:"branch", branch:"work" };
+    const grouped = { portfolio:[], project:[], branch:[] };
+    candidates.forEach(c=>grouped[c.type].push(c));
+    const sectionLabel = { portfolio:"對象", project:"專案", branch:"工項" };
+    const rows = ["portfolio","project","branch"].map(t=>{
+      const list = grouped[t];
+      if(!list.length) return "";
+      const willBecome = typeWord(childTypeOf[t]);
+      return `<div class="muted" style="font-size:10px;margin:10px 0 4px">搬到${sectionLabel[t]}底下 → 變成「${willBecome}」</div>` +
+        list.map(c=>`<button class="btn btn-secondary full mb6" style="justify-content:flex-start" data-act="move-to" data-pid="${c.id}">
            ${codes[c.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[c.id]}</span> `:""}${esc(c.title)}
-         </button>`).join("")
-      : `<div class="muted" style="font-size:12px;padding:8px 0">沒有其他可放的${word}。</div>`;
+         </button>`).join("");
+    }).join("");
     return html`
     <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
       <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd);max-height:80vh;overflow:auto">
         <div class="flex between aic mb10">
-          <div style="font-family:'Lora',serif;font-size:16px">搬移「${esc(node.title)}」到哪個${word}？</div>
+          <div style="font-family:'Lora',serif;font-size:16px">搬移「${esc(node.title)}」到哪裡？</div>
           <button class="back" data-act="move-cancel">×</button>
         </div>
-        <div class="muted" style="font-size:11px;margin-bottom:10px">選一個新的上層，確認後就會搬過去（歷程保留）。</div>
-        ${rows}
-        <button class="btn btn-ghost full mt8" data-act="move-cancel">取消</button>
-      </div>
-    </div>`;
+        <div class="muted" style="font-size:11px;margin-bottom:10px">可以跨階層搬——搬到哪一層底下，就會自動變成該層對應的類型（歷程保留）。若底下還有子項目，換階層前請先處理好子項目。</div>
+        ${rows || `<div class="muted" style="font-size:12px;padding:8px 0">沒有其他可搬去的地方。</div>`}
+        <button class="btn btn-ghost full mt10" data-act="move-cancel">取消</button>
+      </div></div>`;
   }
 
   /* ─── CAPTURE ──────────────────────────────────────────────────────────── */
@@ -1359,7 +1376,7 @@
           }
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
-        ${(!isFactory&&node.type==="portfolio")?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">✕ 刪除</button>`:""}
+        ${(!isFactory&&!node.mergeIntoId)?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">✕ 刪除</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
         ${maturityPill(node,true)}${staleBadge(node)}
@@ -1532,6 +1549,7 @@
             : `<div class="flex aic gap4" style="flex:1;min-width:0;cursor:pointer" data-act="tree-edit" data-id="${n.id}">${titleContent}</div>`
           }
           <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px;flex-shrink:0">⇄</button>
+          <button class="btn btn-ghost sm" data-act="node-delete" data-id="${n.id}" title="刪除" style="padding:2px 7px;flex-shrink:0;color:var(--clay)">✕</button>
         </div>`;
       }
       let listHtml = "";
@@ -1795,12 +1813,37 @@
     </div>`;
   }
 
+  function healthResultsHtml(){
+    const issues = S.healthIssues || [];
+    if(!issues.length) return `<div class="muted" style="font-size:12px;margin-top:10px;color:var(--moss)">✓ 沒有發現不合法的狀態值。</div>`;
+    return html`
+    <div style="margin-top:12px">
+      <div class="muted" style="font-size:11px;margin-bottom:8px">發現 ${issues.length} 筆：</div>
+      ${issues.map(i=>`
+        <div class="flex between aic" style="padding:8px 0;border-top:1px solid var(--line)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:12px;font-weight:600">${esc(i.title)}</div>
+            <div style="font-size:10px;color:var(--inkLight)">${typeWord(i.type)} · 目前值：「${esc(i.value||"(空)")}」→ 建議改為「${lblEn(i.fix)}」</div>
+          </div>
+          <button class="btn btn-ghost sm" data-act="health-fix-one" data-id="${i.id}">修正</button>
+        </div>`).join("")}
+      <button class="btn btn-moss full mt10" data-act="health-fix-all">全部套用修正</button>
+    </div>`;
+  }
+
   /* ─── SETTINGS (sync config) ───────────────────────────────────────────── */
   function viewSettings(){
     const connected = !!S.syncUrl;
     return html`
     ${topbar("設定 Settings","Google Sheets 同步")}
     <div class="pad">
+      <div class="sect">資料健檢 Data Health Check</div>
+      <div class="card" style="padding:14px;margin-bottom:14px">
+        <div class="muted" style="font-size:11px;margin-bottom:10px">掃描所有節點的狀態值（對象/專案/工項/待辦），找出不在目前合法選項內的資料——通常是舊資料或匯入造成，會讓該節點的狀態按鈕看起來「選不到、對不上」。掃描只列出清單，確認後才會套用修正。</div>
+        <button class="btn btn-secondary full" data-act="health-scan">🩺 掃描</button>
+        ${S.healthIssues!==null ? healthResultsHtml() : ""}
+      </div>
+
       <div class="sect">雲端同步 Cloud Sync</div>
       <div class="note-info" style="border-radius:var(--r);padding:12px 14px;margin-bottom:14px;font-size:11px;line-height:1.7">
         把資料同步到你自己的 Google 試算表，跨裝置接續工作。同步是<b>同步層</b>，不是真相來源——Excel 匯出仍是備份。
@@ -1991,6 +2034,9 @@
         case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("title-edit-input"); if(el){el.focus();el.select();} },30); break;
         case "tree-edit": S.treeEditId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("tree-edit-input"); if(el){el.focus();el.select();} },30); break;
         case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
+        case "health-scan": healthScan(); break;
+        case "health-fix-one": healthFixOne(t.getAttribute("data-id")); break;
+        case "health-fix-all": healthFixAll(); break;
         case "cycle-priority": cyclePriority(t.getAttribute("data-id")); break;
         case "w-done": wDone(t.getAttribute("data-id")); break;
         case "w-delay": wDelay(t.getAttribute("data-id")); break;
@@ -2133,8 +2179,18 @@
       ? `確定刪除「${node.title}」及底下 ${childCount} 個子項目？此操作無法復原。`
       : `確定刪除「${node.title}」？此操作無法復原。`;
     if(!confirm(msg)) return;
+    const wasViewingSelf = S.selectedId===id;
+    const parentId = node.parentId, parentType = node.parentType;
     S.nodes = S.nodes.filter(n=>!toDelete.has(n.id));
-    S.selectedId=null; S.view="portfolio";
+    if(wasViewingSelf){
+      if(node.type==="portfolio" || !parentId || !byId(S.nodes,parentId)){
+        S.selectedId=null; S.view="portfolio";
+      } else {
+        S.selectedId=parentId; S.view="detail";
+        S.detailTab = parentType==="portfolio" ? "info" : "branch";
+      }
+    }
+    // else: deleted a descendant from the tree tab — stay on the current page
     render(); maybeSync("delete");
   }
   function doPin(id){
@@ -2188,11 +2244,37 @@
   function doMove(newParentId){
     const node = byId(S.nodes, S.moveFor); if(!node) return;
     const np = byId(S.nodes, newParentId); if(!np) return;
+    // defensive: never allow moving into self or own subtree, even if UI state is stale
+    if(collectSubtreeIds(S.nodes, node.id).indexOf(newParentId)>-1) return;
+    const childTypeOf = { portfolio:"project", project:"branch", branch:"work" };
+    const newType = childTypeOf[np.type];
+    if(!newType){ S.moveFor=null; render(); return; }
+    const changingType = node.type!==newType;
+    // a type-changing move re-levels the node — block if it has children, since they were
+    // valid under the OLD type's child-slot and may not be valid under the new one
+    // (e.g. work is terminal; project's children must be branch, not work, etc.)
+    if(changingType && childrenOf(S.nodes, node.id).length>0){
+      toast(`「${node.title}」底下還有子項目，搬到這裡會改變它的類型，請先搬移或處理好子項目再試一次。`);
+      return;
+    }
     const now = todayStr();
-    S.nodes = S.nodes.map(n=> n.id===node.id ? Object.assign({},n,{
-      parentId:newParentId, parentType:np.type, lastUpdated:now
-    }) : n);
+    S.nodes = S.nodes.map(n=>{
+      if(n.id!==node.id) return n;
+      const next = Object.assign({}, n, {
+        parentId:newParentId, parentType:np.type, lastUpdated:now,
+        logs:(n.logs||[]).concat({id:uid("log"),date:now,type:"note",
+          message: changingType ? `搬移並轉為${typeWord(newType)}：${np.title}` : `搬移到：${np.title}`})
+      });
+      if(changingType){
+        next.type = newType; next.transformFrom = n.type; next.transformAt = now;
+        if(newType==="work"){ next.workStatus = n.workStatus||"todo"; delete next.executionStage; }
+        if(newType==="branch"){ next.executionStage = n.executionStage||"ready"; delete next.workStatus; }
+        if(newType==="project"){ next.executionStage = n.executionStage||"ready"; next.stakeholders = n.stakeholders||[]; delete next.workStatus; }
+      }
+      return next;
+    });
     S.moveFor=null;
+    if(changingType && S.selectedId===node.id && newType==="work"){ S.detailTab="info"; }
     render();
     maybeSync("move");
   }
@@ -2303,6 +2385,39 @@
   function editLogDel(logId, fromId){
     updateNode(fromId, n=>{ n.logs=(n.logs||[]).filter(l=>l.id!==logId); return n; });
     S.editLogId=null; render(); maybeSync("log-del");
+  }
+  // ── 資料健檢 Data Health Check: find nodes whose maturity field holds a value
+  //    outside the currently valid enum (legacy data / bad import), report before fixing ──
+  function scanStateIssues(){
+    const issues = [];
+    (S.nodes||[]).forEach(n=>{
+      if(n.mergeIntoId) return;
+      if(n.type==="portfolio"){
+        const valid=["active","incubator","archived"];
+        if(!valid.includes(n.portfolioState)) issues.push({id:n.id,title:n.title,type:n.type,field:"portfolioState",value:n.portfolioState,fix:"active"});
+      } else if(n.type==="project"||n.type==="branch"){
+        const valid=["ready","developing","blocked","complete"];
+        if(!valid.includes(n.executionStage)) issues.push({id:n.id,title:n.title,type:n.type,field:"executionStage",value:n.executionStage,fix:"ready"});
+      } else if(n.type==="work"){
+        const valid=["todo","doing","done"];
+        if(!valid.includes(n.workStatus)) issues.push({id:n.id,title:n.title,type:n.type,field:"workStatus",value:n.workStatus,fix:"todo"});
+      }
+    });
+    return issues;
+  }
+  function healthScan(){ S.healthIssues = scanStateIssues(); render(); }
+  function healthFixOne(id){
+    const issue = (S.healthIssues||[]).find(i=>i.id===id); if(!issue) return;
+    updateNode(id, n=>{ n[issue.field]=issue.fix; n.lastUpdated=todayStr(); return n; });
+    S.healthIssues = (S.healthIssues||[]).filter(i=>i.id!==id);
+    render(); maybeSync("health-fix");
+  }
+  function healthFixAll(){
+    (S.healthIssues||[]).forEach(issue=>{
+      updateNode(issue.id, n=>{ n[issue.field]=issue.fix; n.lastUpdated=todayStr(); return n; });
+    });
+    S.healthIssues = [];
+    render(); maybeSync("health-fix-all");
   }
   function doTransform(to, freeze){
     const node = byId(S.nodes, S.selectedId); if(!node) return;
