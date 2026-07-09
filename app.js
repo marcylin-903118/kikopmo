@@ -440,9 +440,10 @@
     moreFor:null,       // branch id under which 做更多 adds a 待辦
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
-    chkDraft:"",        // draft text for adding a checklist subtask
     highlightId:null,   // work to highlight after Daily→Project deep link
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
+    editTitleId:null,   // node id whose title is being inline-edited in detail header
+    treeEditId:null,    // node id being inline-edited inside 工項 tree tab
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -525,8 +526,8 @@
     if(!m.metadata || typeof m.metadata!=="object") m.metadata = {};
     if(!m.metadata.priority) m.metadata.priority = "normal";
     if(m.metadata.owner==null && m.owner) m.metadata.owner = m.owner;
-    // checklist only for work
-    if(m.type==="work"){ if(!Array.isArray(m.checklist)) m.checklist=[]; }
+    // checklist removed from Work (B.17.4) — drop any existing data
+    if(m.type==="work"){ delete m.checklist; }
     // portfolioState: collapse inbox/frozen → active (states simplified to active|incubator|archived)
     if(m.type==="portfolio"){
       if(!m.portfolioState || m.portfolioState==="inbox" || m.portfolioState==="frozen")
@@ -1306,11 +1307,16 @@
       }).join("");
     }
 
+    const archivedCount = ns.filter(x=>x.type==="portfolio"&&x.portfolioState==="archived").length;
+    const archivedLink = archivedCount>0
+      ? `<div style="text-align:center;margin-top:16px"><button data-act="pf" data-state="archived" style="background:none;border:none;font-size:11px;color:var(--inkLight);text-decoration:underline;cursor:pointer">查看封存記錄 (${archivedCount})</button></div>`
+      : "";
+
     return html`
     ${topbar("Account 對象", activeCount+" active")}
     <div class="wip">${wipHtml}</div>
     <div class="chips">${chipsHtml}</div>
-    <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}</div>`;
+    <div class="pad-wide" style="max-width:560px;margin:0 auto">${body}${archivedLink}</div>`;
   }
 
   /* ─── DETAIL ───────────────────────────────────────────────────────────── */
@@ -1344,16 +1350,23 @@
             ${typePill(node.type)}
             ${node.mergeIntoId?pill({c:"var(--inkLight)",bg:"var(--bgMuted)",i:"⤳"},"merged"):""}
           </div>
-          <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25">${esc(node.title)}</h2>
+          ${S.editTitleId===node.id
+            ? `<input type="text" id="title-edit-input" value="${esc(node.title)}" style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25;width:100%;border:none;border-bottom:2px solid var(--bamboo);background:transparent;padding:2px 0;outline:none">`
+            : `<div class="flex aic gap4">
+                <h2 style="font-family:'Lora',serif;font-size:17px;font-weight:400;line-height:1.25;flex:1">${esc(node.title)}</h2>
+                ${!isFactory?`<button data-act="title-edit" data-id="${node.id}" style="background:none;border:none;font-size:13px;color:var(--inkLight);cursor:pointer;padding:2px 4px;flex-shrink:0" title="改名">✎</button>`:""}
+              </div>`
+          }
         </div>
         ${(!isFactory&&!node.mergeIntoId&&node.type!=="portfolio")?`<button class="btn btn-ghost sm" data-act="move-start" data-id="${node.id}">⇄ 搬移</button>`:""}
+        ${(!isFactory&&node.type==="portfolio")?`<button class="btn btn-ghost sm" data-act="node-delete" data-id="${node.id}" style="color:var(--clay)">✕ 刪除</button>`:""}
       </div>
       <div class="flex aic gap6 wrap mb14">
         ${maturityPill(node,true)}${staleBadge(node)}
         <span style="font-size:11px;color:var(--inkLight);margin-left:auto">progress ${fmt(node.lastProgress)} · ${lblEn(node.progressSignal||"manual")}</span>
       </div>
       <div class="tabs">
-        ${[["info","總覽"],["branch","工項"]].map(([id,t])=>`
+        ${[["info","總覽"],["branch","專案樹狀圖"]].map(([id,t])=>`
           <button data-act="tab" data-tab="${id}" class="${(S.detailTab===id||(id==="info"&&S.detailTab!=="branch"))?"on":""}">${t}</button>`).join("")}
       </div>
     </div>`;
@@ -1393,7 +1406,7 @@
       const stake = (node.stakeholders&&node.stakeholders.length)
         ? `<div class="card" style="padding:11px 13px;margin-bottom:12px"><span class="label">利害關係人 / 聯絡人</span>${node.stakeholders.map(s=>`<div style="font-size:12px;color:var(--inkMid);padding:3px 0">${esc(s.name)}${s.role?" · "+esc(s.role):""}${s.channel?" · "+esc(s.channel):""}</div>`).join("")}</div>` : "";
 
-      // metadata row for project/branch/work (no priority cycle now — pin lives on Daily)
+      // metadata row — deadline is inline editable
       const showMeta = node.type!=="portfolio";
       const lk = getLink(node);
       const metaRow = showMeta ? html`
@@ -1428,114 +1441,115 @@
           </div>`:`<div class="muted" style="font-size:10px">已達 5 則上限。</div>`}
       </div>`;
 
-      // checklist (Work only)
-      let checklistBlock = "";
-      if(node.type==="work"){
-        const cl = node.checklist||[]; const st = checklistStats(node);
-        checklistBlock = html`
-        <div class="card" style="padding:12px 14px;margin-bottom:12px">
-          <div class="flex between aic mb8"><span class="label" style="margin:0">☑ 子任務 ${st.total?`（${st.done}/${st.total}）`:""}</span></div>
-          ${cl.map((c,i)=>`
-            <div class="flex aic gap8" style="margin-bottom:5px">
-              <button class="btn btn-ghost" style="padding:2px 7px" data-act="chk-toggle" data-idx="${i}">${c.done?"☑":"☐"}</button>
-              <span style="flex:1;font-size:12px;${c.done?'color:var(--inkLight);text-decoration:line-through':'color:var(--inkMid)'}">${esc(c.text)}</span>
-              <button class="btn btn-ghost" style="padding:2px 7px;font-size:11px" data-act="chk-del" data-idx="${i}">×</button>
-            </div>`).join("")}
-          <div class="flex gap6 mt6">
-            <input type="text" data-chk="draft" value="${esc(S.chkDraft||"")}" placeholder="新增一個子任務" style="flex:1">
-            <button class="btn btn-secondary" data-act="chk-add">＋</button>
-          </div>
-          ${node.workStatus==="done"&&st.total&&st.done<st.total?`<div style="margin-top:8px;font-size:11px;color:var(--clay)">⚠ 此待辦已完成，但子任務尚未全部勾選</div>`:""}
-        </div>`;
-      }
-
-      // logs = historical events. For a Project, unify all descendant logs here.
-      let logSource;
-      if(node.type==="project"||node.type==="portfolio"){
-        logSource = [];
-        (function walk(id){ childrenOf(S.nodes,id).forEach(c=>{ (c.logs||[]).forEach(l=>logSource.push({l,from:c})); walk(c.id); }); })(node.id);
-        (node.logs||[]).forEach(l=>logSource.push({l,from:node}));
-        logSource.sort((a,b)=> (b.l.date||"").localeCompare(a.l.date||""));
-      } else {
-        logSource = (node.logs||[]).slice().reverse().map(l=>({l,from:node}));
-      }
-      const logsHtml = logSource.map(({l,from})=>{
-        const cfg = LOG_TYPE_CFG[l.type]||LOG_TYPE_CFG.note;
-        const msg = l.message!=null?l.message:(l.content||"");
-        const fromTag = (from.id!==node.id) ? `<span style="font-size:9px;color:var(--inkLight)"> · ${esc(from.title)}</span>` : "";
-        const editing = S.editLogId===l.id;
-        if(editing){
+      // logs: Work does not show log block (status changed in Daily only)
+      const showLog = node.type!=="work";
+      let logBlock = "";
+      if(showLog){
+        let logSource;
+        if(node.type==="project"||node.type==="portfolio"){
+          logSource = [];
+          (function walk(id){ childrenOf(S.nodes,id).forEach(c=>{ (c.logs||[]).forEach(l=>logSource.push({l,from:c})); walk(c.id); }); })(node.id);
+          (node.logs||[]).forEach(l=>logSource.push({l,from:node}));
+          logSource.sort((a,b)=> (b.l.date||"").localeCompare(a.l.date||""));
+        } else {
+          logSource = (node.logs||[]).slice().reverse().map(l=>({l,from:node}));
+        }
+        const logsHtml = logSource.map(({l,from})=>{
+          const cfg = LOG_TYPE_CFG[l.type]||LOG_TYPE_CFG.note;
+          const msg = l.message!=null?l.message:(l.content||"");
+          const fromTag = (from.id!==node.id) ? `<span style="font-size:9px;color:var(--inkLight)"> · ${esc(from.title)}</span>` : "";
+          const editing = S.editLogId===l.id;
+          if(editing){
+            return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
+              <div class="body" style="flex:1">
+                <input type="text" data-editlog="msg" value="${esc(msg)}" style="width:100%;margin-bottom:6px">
+                <div class="flex gap6 aic">
+                  <input type="date" data-editlog="date" value="${esc(l.date||todayStr())}" style="flex:1">
+                  <button class="btn btn-primary sm" data-act="editlog-save" data-id="${l.id}" data-from="${from.id}">存</button>
+                  <button class="btn btn-ghost sm" data-act="editlog-cancel">取消</button>
+                </div>
+              </div></div>`;
+          }
           return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
-            <div class="body" style="flex:1">
-              <input type="text" data-editlog="msg" value="${esc(msg)}" style="width:100%;margin-bottom:6px">
-              <div class="flex gap6 aic">
-                <input type="date" data-editlog="date" value="${esc(l.date||todayStr())}" style="flex:1">
-                <button class="btn btn-primary sm" data-act="editlog-save" data-id="${l.id}" data-from="${from.id}">存</button>
-                <button class="btn btn-ghost sm" data-act="editlog-cancel">取消</button>
+            <div class="body">
+              <div class="content" style="font-size:13px;color:var(--ink)">${esc(msg)}</div>
+              <div class="meta" style="margin-top:3px">${fmt(l.date)} <span class="tag" style="background:${cfg.bg||'var(--bgMuted)'};color:${cfg.c};font-size:9px;padding:1px 6px">${cfg.label}</span>${fromTag}
+                <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px;margin-left:4px" data-act="editlog-start" data-id="${l.id}">✎</button>
+                <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px" data-act="editlog-del" data-id="${l.id}" data-from="${from.id}">×</button>
               </div>
             </div></div>`;
-        }
-        return `<div class="log"><div class="dot" style="color:${cfg.c}">${cfg.i}</div>
-          <div class="body">
-            <div class="content" style="font-size:13px;color:var(--ink)">${esc(msg)}</div>
-            <div class="meta" style="margin-top:3px">${fmt(l.date)} <span class="tag" style="background:${cfg.bg||'var(--bgMuted)'};color:${cfg.c};font-size:9px;padding:1px 6px">${cfg.label}</span>${fromTag}
-              <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px;margin-left:4px" data-act="editlog-start" data-id="${l.id}">✎</button>
-              <button class="btn btn-ghost" style="padding:1px 6px;font-size:10px" data-act="editlog-del" data-id="${l.id}" data-from="${from.id}">×</button>
-            </div>
-          </div></div>`;
-      }).join("");
+        }).join("");
 
-      const logBlock = html`
-        <div class="sect">${(node.type==="project"||node.type==="portfolio")?"歷程 Log（含底下各工項/待辦）":"歷程 Log"}</div>
-        <div class="card" style="padding:13px;margin-bottom:12px">
-          <textarea data-det="logText" rows="2" placeholder="記一筆：發生了什麼…">${esc(det.logText)}</textarea>
-          <div class="flex gap6 wrap" style="margin-top:8px">
-            <button class="btn sm" style="background:var(--mossBg);color:var(--moss)" data-act="addlog" data-type="progress">＋ 進度</button>
-            <button class="btn sm" style="background:var(--slateBg);color:var(--slate)" data-act="addlog" data-type="decision">＋ 決策</button>
-            <button class="btn sm" style="background:var(--clayBg);color:var(--clay)" data-act="addlog" data-type="blocker">＋ 卡點</button>
-            <button class="btn sm" style="background:var(--bgMuted);color:var(--inkMid)" data-act="addlog" data-type="note">＋ 備註</button>
-            <button class="btn sm" style="background:var(--bambooBg);color:var(--bamboo)" data-act="addlog" data-type="milestone">＋ 里程碑</button>
+        logBlock = html`
+          <div class="sect">${(node.type==="project"||node.type==="portfolio")?"歷程 Log（含底下各工項/待辦）":"歷程 Log"}</div>
+          <div class="card" style="padding:13px;margin-bottom:12px">
+            <textarea data-det="logText" rows="2" placeholder="記一筆：發生了什麼…">${esc(det.logText)}</textarea>
+            <div class="flex gap6 wrap" style="margin-top:8px">
+              <button class="btn sm" style="background:var(--mossBg);color:var(--moss)" data-act="addlog" data-type="progress">＋ 進度</button>
+              <button class="btn sm" style="background:var(--slateBg);color:var(--slate)" data-act="addlog" data-type="decision">＋ 決策</button>
+              <button class="btn sm" style="background:var(--clayBg);color:var(--clay)" data-act="addlog" data-type="blocker">＋ 卡點</button>
+              <button class="btn sm" style="background:var(--bgMuted);color:var(--inkMid)" data-act="addlog" data-type="note">＋ 備註</button>
+              <button class="btn sm" style="background:var(--bambooBg);color:var(--bamboo)" data-act="addlog" data-type="milestone">＋ 里程碑</button>
+            </div>
           </div>
-        </div>
-        ${logsHtml || `<div class="empty">尚無記錄</div>`}`;
+          ${logsHtml || `<div class="empty">尚無記錄</div>`}`;
+      }
 
       tabBody = html`
       <div class="up">
         ${summaryBlock}
         ${stake}
         ${metaRow}
-        ${checklistBlock}
         ${notesBlock}
         ${maturityControl}
         ${logBlock}
       </div>`;
     }
     else {
-      // ── 工項 Branch: overview of all branch(工項)/work(待辦) under this node; edit & move ──
+      // ── 專案樹狀圖: inline rename, no navigation ──
+      const DEPTH_CFG = {
+        project:{ icon:"◆", c:"var(--slate)" },
+        branch: { icon:"❯", c:"var(--bamboo)" },
+        work:   { icon:"▪", c:"var(--clay)" },
+      };
       function row(n, depth){
         const isHi = S.highlightId===n.id;
-        const cl = n.type==="work"?checklistStats(n):null;
         const dd = effDeadline(n);
+        const dc = DEPTH_CFG[n.type]||DEPTH_CFG.work;
+        const isEditing = S.treeEditId===n.id;
+        const titleContent = isEditing
+          ? `<input id="tree-edit-input" type="text" value="${esc(n.title)}" data-tree-id="${n.id}"
+               style="font-size:12px;font-weight:600;flex:1;border:none;border-bottom:2px solid var(--bamboo);background:transparent;padding:1px 0;outline:none;min-width:0">`
+          : `<div class="grow" style="min-width:0">
+               <div style="font-size:12px;font-weight:${n.type==='project'?'700':n.type==='branch'?'600':'500'}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
+               ${dd?`<div class="sub">${fmt(dd)}</div>`:""}
+             </div>`;
         return `
-        <div class="node-row" style="margin-left:${depth*14}px;border-left:3px solid ${TYPE_CFG[n.type].c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
-          <div class="grow tap" data-act="open" data-id="${n.id}">
-            <div style="font-size:12px;font-weight:${n.type==="work"?"700":"600"}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
-            <div class="sub">${S.advanced?lbl(n.type):FRIENDLY[n.type]||n.type}${dd?" · "+fmt(dd):""}${cl&&cl.total?` · ☑${cl.done}/${cl.total}`:""}</div>
-          </div>
-          <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px">⇄</button>
+        <div class="node-row" style="margin-left:${depth*18}px;border-left:3px solid ${dc.c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
+          <span style="font-size:11px;color:${dc.c};margin-right:4px;flex-shrink:0">${dc.icon}</span>
+          ${isEditing
+            ? `<div class="flex aic gap6" style="flex:1;min-width:0">${titleContent}</div>`
+            : `<div class="flex aic gap4" style="flex:1;min-width:0;cursor:pointer" data-act="tree-edit" data-id="${n.id}">${titleContent}</div>`
+          }
+          <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px;flex-shrink:0">⇄</button>
         </div>`;
       }
       let listHtml = "";
-      (function walk(id, depth){
+      function walkAll(id, depth){
         childrenOf(S.nodes,id).forEach(c=>{
-          if(c.type==="branch"||c.type==="work"){ listHtml += row(c, depth); walk(c.id, depth+1); }
-          else walk(c.id, depth);
+          if(c.type==="project"||c.type==="branch"||c.type==="work"){
+            listHtml += row(c, depth);
+            walkAll(c.id, depth+1);
+          } else {
+            walkAll(c.id, depth);
+          }
         });
-      })(node.id);
+      }
+      walkAll(node.id, 0);
       tabBody = html`
       <div class="up">
-        <div class="muted" style="font-size:11px;margin-bottom:10px">本${node.type==="project"?"專案":node.type==="portfolio"?"對象":"項目"}底下的工項與待辦。點項目可編輯，⇄ 可搬移。</div>
-        ${listHtml || `<div class="empty">底下還沒有工項/待辦</div>`}
+        <div class="muted" style="font-size:11px;margin-bottom:10px">點標題可改名，⇄ 可搬移。</div>
+        ${listHtml || `<div class="empty">底下還沒有專案/工項/待辦</div>`}
       </div>`;
     }
 
@@ -1974,6 +1988,9 @@
         case "toggle-advanced": S.advanced=!S.advanced; render(); break;
         case "pin": doPin(t.getAttribute("data-id")); break;
         case "deadline-clear": { const id=t.getAttribute("data-id")||S.selectedId; updateNode(id,n=>{n.deadline=null;n.lastUpdated=todayStr();return n;}); render(); maybeSync("deadline"); break; }
+        case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("title-edit-input"); if(el){el.focus();el.select();} },30); break;
+        case "tree-edit": S.treeEditId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("tree-edit-input"); if(el){el.focus();el.select();} },30); break;
+        case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "cycle-priority": cyclePriority(t.getAttribute("data-id")); break;
         case "w-done": wDone(t.getAttribute("data-id")); break;
         case "w-delay": wDelay(t.getAttribute("data-id")); break;
@@ -1983,9 +2000,6 @@
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
         case "note-add": noteAdd(); break;
         case "note-del": noteDel(+t.getAttribute("data-idx")); break;
-        case "chk-add": chkAdd(); break;
-        case "chk-toggle": chkToggle(+t.getAttribute("data-idx")); break;
-        case "chk-del": chkDel(+t.getAttribute("data-idx")); break;
         case "move-cancel": S.moveFor=null; render(); break;
         case "move-to": doMove(t.getAttribute("data-pid")); break;
         case "sync-save": syncSaveSettings(); break;
@@ -2049,16 +2063,28 @@
       const el = e.target;
       if(el.hasAttribute("data-act-deadline")){
         const id = el.getAttribute("data-act-deadline");
-        const val = el.value || null;
-        updateNode(id, n=>{ n.deadline=val; n.lastUpdated=todayStr(); return n; });
-        render(); maybeSync("deadline");
-        return;
+        updateNode(id, n=>{ n.deadline=el.value||null; n.lastUpdated=todayStr(); return n; });
+        render(); maybeSync("deadline"); return;
       }
       if(el.hasAttribute("data-cap")){ cap[el.getAttribute("data-cap")] = el.value;
         if(el.getAttribute("data-cap")==="target"){ cap.parentId=""; render(); return; }
         refreshCapCommit();
       }
     });
+    root.addEventListener("keydown", e=>{
+      if(e.target.id==="title-edit-input"){
+        if(e.key==="Enter"){ e.preventDefault(); titleSave(S.editTitleId); }
+        if(e.key==="Escape"){ S.editTitleId=null; render(); }
+      }
+      if(e.target.id==="tree-edit-input"){
+        if(e.key==="Enter"){ e.preventDefault(); treeTitleSave(); }
+        if(e.key==="Escape"){ S.treeEditId=null; render(); }
+      }
+    });
+    root.addEventListener("blur", e=>{
+      if(e.target.id==="title-edit-input"){ titleSave(S.editTitleId); }
+      if(e.target.id==="tree-edit-input"){ treeTitleSave(); }
+    }, true);
     root.onchange = e => {
       const el = e.target;
       if(el.hasAttribute("data-cap-check")){ cap[el.getAttribute("data-cap-check")] = el.checked; render(); return; }
@@ -2082,6 +2108,34 @@
   }
   function updateNode(id, fn){
     S.nodes = S.nodes.map(n=>n.id===id?fn(Object.assign({},n)):n);
+  }
+  function titleSave(id){
+    const el = document.getElementById("title-edit-input");
+    const txt = el ? el.value.trim() : "";
+    if(txt) updateNode(id, n=>{ n.title=txt; n.lastUpdated=todayStr(); return n; });
+    S.editTitleId=null;
+    render(); if(txt) maybeSync("rename");
+  }
+  function treeTitleSave(){
+    const id = S.treeEditId; if(!id) return;
+    const el = document.getElementById("tree-edit-input");
+    const txt = el ? el.value.trim() : "";
+    if(txt){ updateNode(id, n=>{ n.title=txt; n.lastUpdated=todayStr(); return n; }); maybeSync("rename"); }
+    S.treeEditId=null; render();
+  }
+  function nodeDelete(id){
+    const node = byId(S.nodes, id); if(!node) return;
+    const toDelete = new Set();
+    function collect(nid){ toDelete.add(nid); childrenOf(S.nodes,nid).forEach(c=>collect(c.id)); }
+    collect(id);
+    const childCount = toDelete.size - 1;
+    const msg = childCount>0
+      ? `確定刪除「${node.title}」及底下 ${childCount} 個子項目？此操作無法復原。`
+      : `確定刪除「${node.title}」？此操作無法復原。`;
+    if(!confirm(msg)) return;
+    S.nodes = S.nodes.filter(n=>!toDelete.has(n.id));
+    S.selectedId=null; S.view="portfolio";
+    render(); maybeSync("delete");
   }
   function doPin(id){
     updateNode(id, n=>{ n.tags=togglePin(n); return n; });
@@ -2332,7 +2386,7 @@
       const made = titles.map((t,i)=>({
         id:uid("wk"), type:"work", parentType:"branch", parentId:p.parentId, title:t, summary:"",
         workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:cap.dday||null,
-        tags:tags.slice(), checklist:[], metadata:{priority:"normal"},
+        tags:tags.slice(), metadata:{priority:"normal"},
         lastProgress:now, progressSignal:"manual", lastUpdated:now,
         logs:[], attachments: i===0?att:[]
       }));
@@ -2360,9 +2414,13 @@
       }
     }
 
-    // reset for next add but KEEP the account selected (keep adding under same account)
+    const committedAccountId = cap.accountId;
     cap.pick=null; cap.title=""; cap.nexts=[]; cap.link=""; cap.dday="";
     cap.logText=""; cap.logDate=""; cap.logType="progress"; cap.images=[];
+    S.selectedId = committedAccountId;
+    S.view = "detail";
+    S.detailTab = "branch";
+    det.showTransform = false;
     render();
     maybeSync("input");
   }
