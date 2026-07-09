@@ -1010,23 +1010,34 @@
         </div></div>`;
     }
     const excluded = new Set(collectSubtreeIds(ns, node.id)); // can't move into self or own descendants
-    const candidates = ns.filter(n=>
-      (n.type==="portfolio"||n.type==="project"||n.type==="branch") &&
-      !n.mergeIntoId && !excluded.has(n.id) && n.id!==node.parentId
-    );
     const childTypeOf = { portfolio:"project", project:"branch", branch:"work" };
-    const grouped = { portfolio:[], project:[], branch:[] };
-    candidates.forEach(c=>grouped[c.type].push(c));
-    const sectionLabel = { portfolio:"對象", project:"專案", branch:"工項" };
-    const rows = ["portfolio","project","branch"].map(t=>{
-      const list = grouped[t];
-      if(!list.length) return "";
-      const willBecome = typeWord(childTypeOf[t]);
-      return `<div class="muted" style="font-size:10px;margin:10px 0 4px">搬到${sectionLabel[t]}底下 → 變成「${willBecome}」</div>` +
-        list.map(c=>`<button class="btn btn-secondary full mb6" style="justify-content:flex-start" data-act="move-to" data-pid="${c.id}">
-           ${codes[c.id]?`<span style="color:var(--inkLight);font-weight:700">${codes[c.id]}</span> `:""}${esc(c.title)}
-         </button>`).join("");
-    }).join("");
+    const ROW_CFG = {
+      portfolio:{ icon:"◉", c:"var(--moss)" },
+      project:  { icon:"◆", c:"var(--slate)" },
+      branch:   { icon:"❯", c:"var(--bamboo)" },
+    };
+    // depth-first, grouped by owning Account, so each candidate carries its breadcrumb
+    // code (A / A.1 / A.1.a) and indentation — instead of three separate flat lists.
+    function candidateRow(c, depth){
+      if(c.mergeIntoId || excluded.has(c.id)) return ""; // self / own subtree — hard exclude, no recursion (avoids a cycle)
+      const isNoOp = c.id===node.parentId; // already its parent — hide just this row, but its other children are still valid targets
+      const rc = ROW_CFG[c.type];
+      const willBecome = typeWord(childTypeOf[c.type]);
+      let out = isNoOp ? "" : `<button class="btn btn-secondary full mb6" style="justify-content:flex-start;margin-left:${depth*16}px;border-left:3px solid ${rc.c};display:flex;align-items:center;gap:6px" data-act="move-to" data-pid="${c.id}">
+        <span style="color:${rc.c};font-size:11px;flex-shrink:0">${rc.icon}</span>
+        ${codes[c.id]?`<span style="color:var(--inkLight);font-weight:700;flex-shrink:0">${codes[c.id]}</span>`:""}
+        <span style="flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.title)}</span>
+        <span style="color:var(--inkLight);font-size:10px;flex-shrink:0">→${willBecome}</span>
+      </button>`;
+      if(c.type==="portfolio"){
+        childrenOf(ns,c.id).filter(x=>x.type==="project").forEach(p=>{ out += candidateRow(p, depth+1); });
+      } else if(c.type==="project"){
+        childrenOf(ns,c.id).filter(x=>x.type==="branch").forEach(b=>{ out += candidateRow(b, depth+1); });
+      }
+      return out;
+    }
+    const rows = ns.filter(n=>n.type==="portfolio" && !n.mergeIntoId)
+      .map(p=>candidateRow(p,0)).join("");
     return html`
     <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
       <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd);max-height:80vh;overflow:auto">
@@ -1034,7 +1045,7 @@
           <div style="font-family:'Lora',serif;font-size:16px">搬移「${esc(node.title)}」到哪裡？</div>
           <button class="back" data-act="move-cancel">×</button>
         </div>
-        <div class="muted" style="font-size:11px;margin-bottom:10px">可以跨階層搬——搬到哪一層底下，就會自動變成該層對應的類型（歷程保留）。若底下還有子項目，換階層前請先處理好子項目。</div>
+        <div class="muted" style="font-size:11px;margin-bottom:10px">依對象分層列出，點哪一項就搬到它底下，自動變成該層對應的類型（歷程保留）。若底下還有子項目，換階層前請先處理好子項目。</div>
         ${rows || `<div class="muted" style="font-size:12px;padding:8px 0">沒有其他可搬去的地方。</div>`}
         <button class="btn btn-ghost full mt10" data-act="move-cancel">取消</button>
       </div></div>`;
