@@ -442,7 +442,8 @@
     mdPreview:false,
     advanced:false,     // UX: hide architecture terms by default
     moveFor:null,       // node id being re-parented (移動到…)
-    moreFor:null,       // branch id under which 做更多 adds a 待辦
+    moreFor:null,       // parent id under which 做更多 adds a child
+    moreKind:"work",    // "work" → add 待辦 under a 工項 | "branch" → add 工項 under a 專案
     moreTitle:"", moreDday:"",
     noteDraft:"",       // draft text for adding a note on detail
     highlightId:null,   // work to highlight after Daily→Project deep link
@@ -971,18 +972,22 @@
     const branch = byId(ns, S.moreFor);
     const codes = buildCodes(ns);
     const ctx = branch ? parentContext(branch, ns, codes) : "";
+    const isBranch = S.moreKind==="branch";
+    const headTxt  = isBranch ? "➕ 新增工項" : "➕ 新增待辦";
+    const fieldTxt = isBranch ? "工項 Branch" : "待辦 Work";
+    const phTxt    = isBranch ? "這個專案要拆出什麼工項" : "要做什麼";
     return html`
     <div style="position:fixed;inset:0;z-index:200;background:rgba(28,26,23,.45);display:flex;align-items:flex-end;justify-content:center">
       <div class="up" style="background:var(--bgCard);border-radius:var(--r) var(--r) 0 0;width:100%;max-width:620px;padding:20px 20px 28px;box-shadow:var(--shadowMd)">
         <div class="flex between aic mb10">
-          <div style="font-family:'Lora',serif;font-size:16px">➕ 新增待辦</div>
+          <div style="font-family:'Lora',serif;font-size:16px">${headTxt}</div>
           <button class="back" data-act="more-cancel">×</button>
         </div>
         <div style="font-size:11px;color:var(--inkLight);margin-bottom:12px">
           ${ctx?ctx+" › ":""}<b>${esc(branch?branch.title:"")}</b> 底下
         </div>
-        <div class="field"><span class="label">待辦 Work</span>
-          <input type="text" data-more="title" value="${esc(S.moreTitle||"")}" placeholder="要做什麼" autofocus></div>
+        <div class="field"><span class="label">${fieldTxt}</span>
+          <input type="text" data-more="title" value="${esc(S.moreTitle||"")}" placeholder="${phTxt}" autofocus></div>
         <div class="field"><span class="label">交期 D-DAY（可留空）</span>
           <input type="date" data-more="dday" value="${esc(S.moreDday||"")}"></div>
         <div class="flex gap8 mt10">
@@ -2053,7 +2058,7 @@
         case "w-delay": wDelay(t.getAttribute("data-id")); break;
         case "w-more": wMore(t.getAttribute("data-id")); break;
         case "more-save": wMoreSave(); break;
-        case "more-cancel": S.moreFor=null; render(); break;
+        case "more-cancel": S.moreFor=null; S.moreKind="work"; S.moreTitle=""; S.moreDday=""; render(); break;
         case "move-start": S.moveFor=t.getAttribute("data-id"); render(); break;
         case "note-add": noteAdd(); break;
         case "note-del": noteDel(+t.getAttribute("data-idx")); break;
@@ -2327,37 +2332,43 @@
     if(value) tags.push(prefix+value);
     return tags;
   }
-  // ➕ 做更多 — open simple popup to add ONE new 待辦 under the SAME 工項 (parent branch)
+  // ➕ 做更多 — open simple popup to add ONE child under the card's natural parent.
+  //   work card    → adds a sibling 待辦 under its 工項
+  //   branch card  → adds a 待辦 under itself
+  //   project card → adds a 工項 under itself (no longer redirects to detail)
   function wMore(id){
     const node = byId(S.nodes, id);
-    // target 工項 = the branch this work belongs to; if the card itself is a branch, use it
-    // project cards cannot directly add work (need a branch first) → open detail instead
-    let branchId = null;
-    if(node){
-      if(node.type==="work") branchId = node.parentId;
-      else if(node.type==="branch") branchId = node.id;
-      else if(node.type==="project"){
-        // redirect to project detail so user can add a branch first
-        S.selectedId = node.id; S.view = "detail"; render(); return;
-      } else branchId = null; // shouldn't happen
-    }
-    if(!branchId){ return; }
-    S.moreFor = branchId;
+    if(!node) return;
+    let parentId = null, kind = "work";
+    if(node.type==="work"){ parentId = node.parentId; kind = "work"; }
+    else if(node.type==="branch"){ parentId = node.id; kind = "work"; }
+    else if(node.type==="project"){ parentId = node.id; kind = "branch"; }
+    else return;
+    if(!parentId) return;
+    S.moreFor = parentId;
+    S.moreKind = kind;
     S.moreTitle = ""; S.moreDday = "";
     render();
   }
   function wMoreSave(){
-    const branchId = S.moreFor; if(!branchId) return;
-    const title=(S.moreTitle||"").trim(); if(!title){ S.moreFor=null; render(); return; }
+    const parentId = S.moreFor; if(!parentId) return;
+    const title=(S.moreTitle||"").trim();
+    if(!title){ S.moreFor=null; S.moreKind="work"; render(); return; }
     const now=todayStr();
     const tags = S.moreDday ? [TAG_DDAY+S.moreDday] : [];
-    S.nodes = S.nodes.concat({
-      id:uid("wk"), type:"work", parentType:"branch", parentId:branchId, title,
-      summary:"", workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:S.moreDday||null,
-      tags, lastProgress:now, progressSignal:"manual", lastUpdated:now,
+    const kind = S.moreKind==="branch" ? "branch" : "work";
+    const node = kind==="branch"
+      ? { id:uid("br"), type:"branch", parentType:"project", parentId, title,
+          summary:"", executionStage:"ready", channel:"", firstSuccessEvent:"", deadline:S.moreDday||null }
+      : { id:uid("wk"), type:"work", parentType:"branch", parentId, title,
+          summary:"", workStatus:"todo", owner:"", firstSuccessEvent:"", deadline:S.moreDday||null };
+    Object.assign(node, {
+      tags, metadata:{priority:"normal"},
+      lastProgress:now, progressSignal:"manual", lastUpdated:now,
       logs:[], attachments:[]
     });
-    S.moreFor=null; S.moreTitle=""; S.moreDday="";
+    S.nodes = S.nodes.concat(node);
+    S.moreFor=null; S.moreKind="work"; S.moreTitle=""; S.moreDday="";
     render();
     maybeSync("more");
   }
