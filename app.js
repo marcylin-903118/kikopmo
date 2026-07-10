@@ -450,6 +450,7 @@
     editLogId:null, editLogMsg:"", editLogDate:"",  // editing a log entry
     editTitleId:null,   // node id whose title is being inline-edited in detail header
     treeEditId:null,    // node id being inline-edited inside 工項 tree tab
+    treeDateId:null,    // node id whose D-DAY is being inline-edited in the tree tab
     // ── Google Sheets sync (via Apps Script Web App) ──
     syncUrl:"",         // user-pasted Web App URL
     syncDevice:"",      // this device's friendly name
@@ -1550,19 +1551,26 @@
         const dd = effDeadline(n);
         const dc = DEPTH_CFG[n.type]||DEPTH_CFG.work;
         const isEditing = S.treeEditId===n.id;
+        const isDating  = S.treeDateId===n.id;
+        // date row is ALWAYS rendered — 未定 when unset — so it stays tappable
+        const dateRow = isDating
+          ? `<input id="tree-date-input" type="date" value="${esc(dd||"")}" data-tree-date-id="${n.id}"
+               style="font-size:11px;border:none;border-bottom:2px solid var(--bamboo);background:transparent;padding:1px 0;outline:none;max-width:150px">`
+          : `<div class="sub" data-act="tree-date" data-id="${n.id}"
+               style="cursor:pointer;display:inline-block;${dd?"":"color:var(--inkLight);font-style:italic"}">${dd?fmt(dd):"未定"}</div>`;
         const titleContent = isEditing
           ? `<input id="tree-edit-input" type="text" value="${esc(n.title)}" data-tree-id="${n.id}"
                style="font-size:12px;font-weight:600;flex:1;border:none;border-bottom:2px solid var(--bamboo);background:transparent;padding:1px 0;outline:none;min-width:0">`
           : `<div class="grow" style="min-width:0">
-               <div style="font-size:12px;font-weight:${n.type==='project'?'700':n.type==='branch'?'600':'500'}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
-               ${dd?`<div class="sub">${fmt(dd)}</div>`:""}
+               <div style="font-size:12px;font-weight:${n.type==='project'?'700':n.type==='branch'?'600':'500'};cursor:pointer" data-act="tree-edit" data-id="${n.id}">${n.type==="branch"&&branchAutoBlocked(S.nodes,n)?"🚧 ":""}${esc(n.title)}</div>
+               ${dateRow}
              </div>`;
         return `
         <div class="node-row" style="margin-left:${depth*18}px;border-left:3px solid ${dc.c};${isHi?'background:var(--bambooBg);box-shadow:0 0 0 2px var(--bamboo) inset':''}">
           <span style="font-size:11px;color:${dc.c};margin-right:4px;flex-shrink:0">${dc.icon}</span>
           ${isEditing
             ? `<div class="flex aic gap6" style="flex:1;min-width:0">${titleContent}</div>`
-            : `<div class="flex aic gap4" style="flex:1;min-width:0;cursor:pointer" data-act="tree-edit" data-id="${n.id}">${titleContent}</div>`
+            : `<div class="flex aic gap4" style="flex:1;min-width:0">${titleContent}</div>`
           }
           <button class="btn btn-ghost sm" data-act="move-start" data-id="${n.id}" title="搬移" style="padding:2px 7px;flex-shrink:0">⇄</button>
           <button class="btn btn-ghost sm" data-act="node-delete" data-id="${n.id}" title="刪除" style="padding:2px 7px;flex-shrink:0;color:var(--clay)">✕</button>
@@ -1582,7 +1590,7 @@
       walkAll(node.id, 0);
       tabBody = html`
       <div class="up">
-        <div class="muted" style="font-size:11px;margin-bottom:10px">點標題可改名，⇄ 可搬移。</div>
+        <div class="muted" style="font-size:11px;margin-bottom:10px">點標題可改名，點日期可改交期，⇄ 可搬移。</div>
         ${listHtml || `<div class="empty">底下還沒有專案/工項/待辦</div>`}
       </div>`;
     }
@@ -2048,7 +2056,8 @@
         case "pin": doPin(t.getAttribute("data-id")); break;
         case "deadline-clear": { const id=t.getAttribute("data-id")||S.selectedId; updateNode(id,n=>{n.deadline=null;n.lastUpdated=todayStr();return n;}); render(); maybeSync("deadline"); break; }
         case "title-edit": S.editTitleId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("title-edit-input"); if(el){el.focus();el.select();} },30); break;
-        case "tree-edit": S.treeEditId=t.getAttribute("data-id"); render(); setTimeout(()=>{ const el=document.getElementById("tree-edit-input"); if(el){el.focus();el.select();} },30); break;
+        case "tree-edit": S.treeEditId=t.getAttribute("data-id"); S.treeDateId=null; render(); setTimeout(()=>{ const el=document.getElementById("tree-edit-input"); if(el){el.focus();el.select();} },30); break;
+        case "tree-date": S.treeDateId=t.getAttribute("data-id"); S.treeEditId=null; render(); setTimeout(()=>{ const el=document.getElementById("tree-date-input"); if(el){ el.focus(); if(el.showPicker) try{el.showPicker();}catch(_){} } },30); break;
         case "node-delete": nodeDelete(t.getAttribute("data-id")); break;
         case "health-scan": healthScan(); break;
         case "health-fix-one": healthFixOne(t.getAttribute("data-id")); break;
@@ -2142,13 +2151,19 @@
         if(e.key==="Enter"){ e.preventDefault(); treeTitleSave(); }
         if(e.key==="Escape"){ S.treeEditId=null; render(); }
       }
+      if(e.target.id==="tree-date-input"){
+        if(e.key==="Enter"){ e.preventDefault(); treeDateSave(); }
+        if(e.key==="Escape"){ S.treeDateId=null; render(); }
+      }
     });
     root.addEventListener("blur", e=>{
       if(e.target.id==="title-edit-input"){ titleSave(S.editTitleId); }
       if(e.target.id==="tree-edit-input"){ treeTitleSave(); }
+      if(e.target.id==="tree-date-input"){ treeDateSave(); }
     }, true);
     root.onchange = e => {
       const el = e.target;
+      if(el.id==="tree-date-input"){ treeDateSave(); return; }
       if(el.hasAttribute("data-cap-check")){ cap[el.getAttribute("data-cap-check")] = el.checked; render(); return; }
       if(el.id==="capimg"){ handleCapImg(el.files); return; }
       if(el.id==="importfile"){ handleImportFile(el.files[0]); return; }
@@ -2184,6 +2199,25 @@
     const txt = el ? el.value.trim() : "";
     if(txt){ updateNode(id, n=>{ n.title=txt; n.lastUpdated=todayStr(); return n; }); maybeSync("rename"); }
     S.treeEditId=null; render();
+  }
+  // 交期 inline edit in the tree tab. Empty value clears it back to 未定.
+  // Writes BOTH n.deadline and the DDAY: tag so effDeadline() and tag readers agree.
+  function treeDateSave(){
+    const id = S.treeDateId; if(!id) return;
+    const el = document.getElementById("tree-date-input");
+    const val = el ? (el.value||"").trim() : "";
+    const node = byId(S.nodes, id);
+    const prev = node ? (effDeadline(node)||"") : "";
+    if(val !== prev){
+      updateNode(id, n=>{
+        n.deadline = val || null;
+        n.tags = setTagKVlocal(n.tags, TAG_DDAY, val);
+        n.lastUpdated = todayStr();
+        return n;
+      });
+      maybeSync("dday");
+    }
+    S.treeDateId=null; render();
   }
   function nodeDelete(id){
     const node = byId(S.nodes, id); if(!node) return;
