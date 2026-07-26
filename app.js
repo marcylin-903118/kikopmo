@@ -1978,6 +1978,171 @@
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(flat), "nodes_import");
     XLSX.writeFile(wb, `kiko-nodes-${todayStr()}.xlsx`);
   }
+
+  /* ─── REVIEW EXPORT / IMPORT (desktop overview round-trip) ─────────────────
+     Exports every non-archived portfolio + its whole subtree, 9 columns, for
+     wide-screen review and adjustment, then re-import (match by id) updating
+     ONLY these fields, preserving everything else.
+
+     Unified `status` column (per §A decision):
+       work            → todo | doing | done
+       project/branch  → open | complete
+         · "open"     = "not complete": preserve existing non-complete
+                        executionStage; default developing when empty.
+                        Never overwrites an auto-detected blocked/ready.
+         · "complete" = executionStage: complete
+       account (portfolio) → blank (no status edited here)
+     tags joined with "|"; dates emitted as ISO YYYY-MM-DD.            */
+
+  const REVIEW_COLS = ["id","type","parentType","parentId","title","status","deadline","lastProgress","tags"];
+  const REVIEW_STATUS_LIST = ["todo","doing","done","open","complete"];
+
+  // node → the value written in the sheet's `status` column
+  function reviewStatusOut(n){
+    if(n.type==="work") return n.workStatus || "todo";
+    if(n.type==="project"||n.type==="branch") return n.executionStage==="complete" ? "complete" : "open";
+    return ""; // portfolio / capture
+  }
+
+  // Convert anything Excel might hand back (YYYY-MM-DD, YYYY/MM/DD, Date serial,
+  // Date object) into ISO YYYY-MM-DD. Empty/invalid → "".
+  function normDate(v){
+    if(v==null || v==="") return "";
+    if(v instanceof Date && !isNaN(v)) return v.toISOString().slice(0,10);
+    if(typeof v==="number" && isFinite(v)){
+      // Excel serial date via SheetJS epoch: (serial - 25569) days after 1970-01-01.
+      const ms = Math.round((v - 25569) * 86400000);
+      const d = new Date(ms);
+      return isNaN(d) ? "" : d.toISOString().slice(0,10);
+    }
+    const s = String(v).trim();
+    let m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+    if(m){
+      const y=m[1], mo=String(+m[2]).padStart(2,"0"), da=String(+m[3]).padStart(2,"0");
+      return `${y}-${mo}-${da}`;
+    }
+    const d = new Date(s);
+    return isNaN(d) ? "" : d.toISOString().slice(0,10);
+  }
+
+  // Every non-archived portfolio subtree, in tree order (portfolio → project →
+  // branch → work), captures excluded.
+  function reviewScopeNodes(ns){
+    const roots = ns.filter(n=>n.type==="portfolio" && n.portfolioState!=="archived" && !n.mergeIntoId);
+    const keep = new Set();
+    roots.forEach(r=>collectSubtreeIds(ns, r.id).forEach(id=>keep.add(id)));
+    const ordered = [];
+    function walk(id){
+      const n = byId(ns,id); if(!n) return;
+      if(keep.has(id) && !n.mergeIntoId && n.type!=="capture") ordered.push(n);
+      childrenOf(ns,id).forEach(c=>walk(c.id));
+    }
+    roots.forEach(r=>walk(r.id));
+    return ordered;
+  }
+
+  function reviewRows(ns){
+    return reviewScopeNodes(ns).map(n=>({
+      id: n.id,
+      type: n.type,
+      parentType: n.parentType||"",
+      parentId: n.parentId||"",
+      title: n.title||"",
+      status: reviewStatusOut(n),
+      deadline: normDate(n.deadline),
+      lastProgress: normDate(n.lastProgress),
+      tags: (n.tags||[]).join("|"),
+    }));
+  }
+
+  function exportReviewExcel(){
+    if(!ensureXLSX()) return;
+    const rows = reviewRows(S.nodes);
+    if(!rows.length){ alert("沒有未封存的對象可匯出。No non-archived accounts to export."); return; }
+    const ws = XLSX.utils.json_to_sheet(rows, { header: REVIEW_COLS });
+    ws["!cols"] = [
+      {wch:14},{wch:10},{wch:11},{wch:14},{wch:40},{wch:11},{wch:12},{wch:12},{wch:26}
+    ];
+    // status column (F) is free text; a header comment lists the legal values as a
+    // cheat-sheet. Import re-checks and flags anything illegal, leaving the cell as-is.
+    if(ws["F1"]){
+      ws["F1"].c = [{ a:"Kikō", t:"待辦 work: todo / doing / done\n專案·工項 project·branch: open / complete", T:true }];
+    }
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "review");
+    XLSX.writeFile(wb, `kiko-review-${todayStr()}.xlsx`);
+  }
+
+  // Read a review .xlsx by cells (sheet_to_json — no CSV, so commas in titles are safe).
+  async function handleReviewFile(file){
+    if(!file) return;
+    if(typeof XLSX==="undefined"){ alert("Excel library not loaded (offline?)."); return; }
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, {type:"array", cellDates:true});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(ws, {defval:""});
+      applyReviewRows(raw);
+    } catch(err){ alert("讀取失敗 Could not read file: "+err.message); }
+  }
+
+  // Update matching nodes by id (only the 9 fields; everything else preserved).
+  function applyReviewRows(raw){
+    const ns = S.nodes;
+    const byIdMap = new Map(ns.map(n=>[n.id,n]));
+    const report = { updated:0, skippedNoId:0, skippedNoMatch:0, badStatus:[] };
+    let next = ns.slice();
+
+    raw.forEach(r=>{
+      const id = String(r.id||"").trim();
+      if(!id){ report.skippedNoId++; return; }
+      const ex = byIdMap.get(id);
+      if(!ex){ report.skippedNoMatch++; return; }
+
+      const patch = {};
+      const title = String(r.title==null?"":r.title).trim();
+      if(title) patch.title = title;
+      if("tags" in r){
+        patch.tags = String(r.tags==null?"":r.tags).split("|").map(s=>s.trim()).filter(Boolean);
+      }
+      if("deadline" in r){ const d=normDate(r.deadline); patch.deadline = d || null; }
+      if("lastProgress" in r){ const d=normDate(r.lastProgress); if(d) patch.lastProgress = d; }
+
+      // status → route by the EXISTING node's type
+      const st = String(r.status==null?"":r.status).trim().toLowerCase();
+      if(st){
+        if(ex.type==="work"){
+          if(["todo","doing","done"].includes(st)) patch.workStatus = st;
+          else report.badStatus.push(`${ex.title}: "${st}"`);
+        } else if(ex.type==="project"||ex.type==="branch"){
+          if(st==="complete") patch.executionStage = "complete";
+          else if(st==="open"){
+            // "not complete": preserve existing non-complete stage; fill developing when empty.
+            if(!ex.executionStage || ex.executionStage==="complete") patch.executionStage = "developing";
+          } else report.badStatus.push(`${ex.title}: "${st}"`);
+        }
+        // portfolio/capture: ignore status silently
+      }
+
+      if(Object.keys(patch).length){
+        patch.lastUpdated = todayStr();
+        next = next.map(n=> n.id===id ? Object.assign({}, n, patch) : n);
+        report.updated++;
+      }
+    });
+
+    S.nodes = next;
+    S.view = "portfolio";
+    render();
+    maybeSync("review-import");
+
+    const lines = [`匯回完成 Review import done`, `更新 updated: ${report.updated}`];
+    if(report.skippedNoMatch) lines.push(`找不到 id no match: ${report.skippedNoMatch}`);
+    if(report.skippedNoId) lines.push(`缺 id missing id: ${report.skippedNoId}`);
+    if(report.badStatus.length) lines.push(`狀態不符 bad status (${report.badStatus.length}): ${report.badStatus.slice(0,8).join(" · ")}`);
+    alert(lines.join("\n"));
+  }
+
   function exportSnapshotExcel(){
     if(!ensureXLSX()) return;
     const s = buildSnapshot(S.nodes);
@@ -2002,6 +2167,13 @@
     return html`
     ${topbar("Export 匯出","raw data + PMO snapshot")}
     <div class="pad">
+      <div class="sect">Review 通盤檢視（桌機）</div>
+      <div class="card mb14" style="padding:14px">
+        <div style="font-size:12px;color:var(--inkMid);margin-bottom:10px">未封存對象及其下所有階層，精簡 9 欄，供桌機全面瀏覽、調整後再匯回（依 id 對應，只更新這幾欄）。Non-archived accounts + subtree; edit on desktop and re-import.</div>
+        <button class="btn btn-secondary full mb10" data-act="export-review">⤓ Export Review.xlsx</button>
+        <button class="btn btn-secondary full" data-act="pick-review">⤒ Import Review.xlsx 匯回</button>
+        <input type="file" accept=".xlsx,.xls" id="reviewfile" style="display:none">
+      </div>
       <div class="sect">Raw Data 原始資料</div>
       <div class="card mb14" style="padding:14px">
         <div style="font-size:12px;color:var(--inkMid);margin-bottom:10px">Full node tree as a flat Excel sheet (re-importable). 完整節點樹（可再匯入）。</div>
@@ -2099,6 +2271,8 @@
         case "import-compute": computeReport(); break;
         case "import-apply": applyImport(); break;
         case "export-raw": exportRawExcel(); break;
+        case "export-review": exportReviewExcel(); break;
+        case "pick-review": document.getElementById("reviewfile").click(); break;
         case "export-snap-xlsx": exportSnapshotExcel(); break;
         case "export-snap-md": downloadMarkdown(); break;
         case "toggle-md": S.mdPreview=!S.mdPreview; render(); break;
@@ -2167,6 +2341,7 @@
       if(el.hasAttribute("data-cap-check")){ cap[el.getAttribute("data-cap-check")] = el.checked; render(); return; }
       if(el.id==="capimg"){ handleCapImg(el.files); return; }
       if(el.id==="importfile"){ handleImportFile(el.files[0]); return; }
+      if(el.id==="reviewfile"){ handleReviewFile(el.files[0]); return; }
     };
     // Chinese IME: 'input' may not fire during composition — capture the final value
     root.addEventListener("compositionend", e=>{
